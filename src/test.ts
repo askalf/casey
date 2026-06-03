@@ -20,6 +20,9 @@ import { WebChannel } from "./channels/web.js";
 import { SlackChannel } from "./channels/slack.js";
 import { TeamsChannel } from "./channels/teams.js";
 import { DiscordChannel } from "./channels/discord.js";
+import { SmsChannel } from "./channels/sms.js";
+import { VoiceChannel } from "./channels/voice.js";
+import { verifyTwilio, formParams } from "./channels/twilio-common.js";
 import type { ChannelServer, ServerRequest, ServerResponse, InboundMessage } from "./channels/types.js";
 
 interface Case {
@@ -249,6 +252,81 @@ function discordTests(): void {
   check("discord: constructs as a connection channel", d.name === "discord" && d.kind === "connection");
 }
 
+function signTwilio(token: string, url: string, params: Record<string, string>): string {
+  const data = url + Object.keys(params).sort().map((k) => k + params[k]).join("");
+  return createHmac("sha1", token).update(Buffer.from(data, "utf8")).digest("base64");
+}
+
+function twilioCommonTests(): void {
+  const token = "tw-token";
+  const url = "https://x.test/sms";
+  const params = { From: "+1999", Body: "hello" };
+  check("twilio: valid signature verifies", verifyTwilio(token, url, params, signTwilio(token, url, params)));
+  check("twilio: wrong signature rejected", !verifyTwilio(token, url, params, "bogus"));
+  check("twilio: formParams parses urlencoded", formParams("From=%2B1999&Body=hi").Body === "hi");
+}
+
+async function smsTests(): Promise<void> {
+  const token = "tw-token";
+  const base = "https://x.test";
+  const sms = new SmsChannel("ACxxx", token, "+15550001111", base);
+  const server = new MockServer();
+  const got: InboundMessage[] = [];
+  sms.register(server, async (m) => {
+    got.push(m);
+    return null;
+  });
+  check("sms: registers /sms", server.routes.has("POST /sms"));
+  const post = server.routes.get("POST /sms")!;
+  const params = { From: "+15559998888", Body: "my laptop won't boot" };
+  const body = new URLSearchParams(params).toString();
+  const ok = await post({
+    method: "POST", path: "/sms", query: {},
+    headers: { "x-twilio-signature": signTwilio(token, base + "/sms", params) },
+    body,
+  });
+  const m = got[0];
+  check(
+    "sms: signed message acked (TwiML) + parsed",
+    ok.status === 200 && (ok.headers?.["content-type"] || "").includes("xml") && got.length === 1 && m?.channel === "sms" && m?.conversationId === "sms:+15559998888" && m?.text === "my laptop won't boot",
+    JSON.stringify(m ?? null),
+  );
+  const bad = await post({ method: "POST", path: "/sms", query: {}, headers: { "x-twilio-signature": "nope" }, body });
+  check("sms: bad signature → 403", bad.status === 403);
+}
+
+async function voiceTests(): Promise<void> {
+  const token = "tw-token";
+  const base = "https://x.test";
+  const voice = new VoiceChannel(token, base);
+  const server = new MockServer();
+  voice.register(server, async (m) => ({ channel: m.channel, conversationId: m.conversationId, to: m.from, text: "Please try restarting it." }));
+  check("voice: registers /voice + /voice/gather", server.routes.has("POST /voice") && server.routes.has("POST /voice/gather"));
+
+  const callParams = { CallSid: "CA1", From: "+1777" };
+  const call = await server.routes.get("POST /voice")!({
+    method: "POST", path: "/voice", query: {},
+    headers: { "x-twilio-signature": signTwilio(token, base + "/voice", callParams) },
+    body: new URLSearchParams(callParams).toString(),
+  });
+  check("voice: inbound call gathers speech", call.status === 200 && call.body.includes("<Gather") && call.body.includes("describe your issue"), call.body.slice(0, 80));
+
+  const gp = { CallSid: "CA1", From: "+1777", SpeechResult: "my email is broken" };
+  const g = await server.routes.get("POST /voice/gather")!({
+    method: "POST", path: "/voice/gather", query: {},
+    headers: { "x-twilio-signature": signTwilio(token, base + "/voice/gather", gp) },
+    body: new URLSearchParams(gp).toString(),
+  });
+  check("voice: speech result spoken back via TwiML", g.status === 200 && g.body.includes("Please try restarting it.") && g.body.includes("<Gather"), g.body.slice(0, 120));
+
+  const bad = await server.routes.get("POST /voice/gather")!({
+    method: "POST", path: "/voice/gather", query: {},
+    headers: { "x-twilio-signature": "nope" },
+    body: new URLSearchParams(gp).toString(),
+  });
+  check("voice: bad signature → 403", bad.status === 403);
+}
+
 async function main(): Promise<void> {
   parseTests();
   schemaTests();
@@ -260,6 +338,9 @@ async function main(): Promise<void> {
   await slackTests();
   await teamsTests();
   discordTests();
+  twilioCommonTests();
+  await smsTests();
+  await voiceTests();
 
   console.log("\n" + "=".repeat(60));
   console.log("CASEY TESTS");

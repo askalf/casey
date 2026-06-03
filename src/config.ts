@@ -14,6 +14,8 @@ export interface Config {
   slack: boolean; // Slack Events API (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)
   discord: boolean; // Discord gateway (env: DISCORD_BOT_TOKEN)
   teams: boolean; // MS Teams Bot Framework (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD)
+  sms: boolean; // Twilio SMS (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER)
+  voice: boolean; // Twilio Voice (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
   showHelp: boolean;
   showVersion: boolean;
 }
@@ -28,6 +30,8 @@ const DEFAULTS: Config = {
   slack: false,
   discord: false,
   teams: false,
+  sms: false,
+  voice: false,
   showHelp: false,
   showVersion: false,
 };
@@ -87,6 +91,12 @@ export function parseArgs(argv: string[]): { config: Config; command: string; ar
       case "--teams":
         config.teams = true;
         break;
+      case "--sms":
+        config.sms = true;
+        break;
+      case "--voice":
+        config.voice = true;
+        break;
       case "--port": {
         const v = parseInt(next("--port"), 10);
         if (!Number.isFinite(v) || v <= 0 || v > 65535) throw new Error("--port must be a port number (1-65535)");
@@ -123,7 +133,9 @@ Channels (serve):
   --slack              Slack Events API (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET).
   --discord            Discord gateway bot (env: DISCORD_BOT_TOKEN).
   --teams              MS Teams Bot Framework (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD).
-  --port <n>           HTTP port for web/webhook/slack/teams endpoints (default: 8787)
+  --sms                Twilio SMS (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER).
+  --voice              Twilio Voice — spoken support line (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).
+  --port <n>           HTTP port for web/webhook/slack/teams/sms/voice endpoints (default: 8787)
 
 Options:
   --dario              Route the LLM through a local dario proxy (localhost:3456)

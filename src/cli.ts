@@ -15,6 +15,8 @@ import { WebChannel } from "./channels/web.js";
 import { SlackChannel } from "./channels/slack.js";
 import { DiscordChannel } from "./channels/discord.js";
 import { TeamsChannel } from "./channels/teams.js";
+import { SmsChannel } from "./channels/sms.js";
+import { VoiceChannel } from "./channels/voice.js";
 import { HttpServer } from "./server.js";
 import type { Channel, InboundMessage } from "./channels/types.js";
 
@@ -156,6 +158,30 @@ async function buildChannels(config: Config): Promise<Channel[]> {
       console.log(chalk.dim(`  teams: POST /teams/messages`));
     } else {
       console.error(chalk.red("  teams: --teams set but TEAMS_APP_ID / TEAMS_APP_PASSWORD missing — skipping"));
+    }
+  }
+
+  const twilioBase = process.env.TWILIO_PUBLIC_BASE;
+  if (config.sms) {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const tok = process.env.TWILIO_AUTH_TOKEN;
+    const num = process.env.TWILIO_NUMBER;
+    if (sid && tok && num) {
+      channels.push(new SmsChannel(sid, tok, num, twilioBase));
+      console.log(chalk.dim(`  sms:   POST /sms`));
+    } else {
+      console.error(chalk.red("  sms: --sms set but TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_NUMBER missing — skipping"));
+    }
+  }
+
+  if (config.voice) {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const tok = process.env.TWILIO_AUTH_TOKEN;
+    if (sid && tok) {
+      channels.push(new VoiceChannel(tok, twilioBase));
+      console.log(chalk.dim(`  voice: POST /voice (spoken support line)`));
+    } else {
+      console.error(chalk.red("  voice: --voice set but TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing — skipping"));
     }
   }
 

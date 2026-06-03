@@ -31,7 +31,8 @@ The deciding question between Tier-2 and Tier-3 is *who can act*: if a single us
 | **Slack** | ✅ built | `--slack` + `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` |
 | **Discord** | ✅ built | `--discord` + `DISCORD_BOT_TOKEN` |
 | **Microsoft Teams** | ✅ built | `--teams` + `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD` |
-| SMS / Voice | 🚧 roadmap | Twilio adapters (Phase 3) |
+| **SMS** (Twilio) | ✅ built | `--sms` + `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER` |
+| **Voice** (Twilio) | ✅ built | `--voice` + `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` |
 
 *✅ built* = adapter complete and offline-tested; live-validated once you provision that platform's credentials. New channels are just an adapter that implements the `Channel` interface (`receive`/`listen` → `reply`); the triage → troubleshoot → escalate pipeline doesn't change.
 
@@ -99,6 +100,18 @@ TEAMS_APP_ID=…  TEAMS_APP_PASSWORD=…             casey serve --teams --dario
 
 All flags compose — `casey serve --web --slack --discord --teams --dario` runs every channel against one pipeline at once.
 
+### Phone channels (SMS / Voice via Twilio)
+
+```
+TWILIO_ACCOUNT_SID=AC…  TWILIO_AUTH_TOKEN=…  TWILIO_NUMBER=+1…  casey serve --sms --dario
+TWILIO_ACCOUNT_SID=AC…  TWILIO_AUTH_TOKEN=…                      casey serve --voice --dario
+```
+
+- **SMS** — point your Twilio number's Messaging webhook at `https://<host>/sms`. casey verifies the Twilio signature, replies via the Messaging API, and threads by sender number.
+- **Voice** — point the number's Voice webhook at `https://<host>/voice`. casey greets the caller, gathers speech, triages it, and speaks the reply (TwiML), looping until the caller's done. Replies are spoken inline, so watch model latency against Twilio's webhook timeout for long troubleshooting turns.
+
+If signature verification trips behind a proxy, set `TWILIO_PUBLIC_BASE=https://<host>` so the signed URL is reconstructed exactly.
+
 ## Configuration
 
 `~/.casey/email.json` (print a template with `casey email-config`):
@@ -124,7 +137,9 @@ Credentials stay in this local file — they're never sent anywhere but your mai
 --slack              Slack Events API channel   (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)
 --discord            Discord gateway bot        (env: DISCORD_BOT_TOKEN)
 --teams              MS Teams Bot Framework      (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD)
---port <n>           HTTP port for web/webhook/slack/teams (default: 8787)
+--sms                Twilio SMS                  (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER)
+--voice              Twilio Voice (spoken line)  (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+--port <n>           HTTP port for web/webhook/slack/teams/sms/voice (default: 8787)
 --arnie-queue <dir>  Drop Tier-3 hand-offs into <dir>/inbox as arnie *.task files
 --email-config <f>   Path to the IMAP/SMTP config (default: ~/.casey/email.json)
 --interval <sec>     Seconds between inbox polls in serve (default: 30)
