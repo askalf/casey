@@ -7,9 +7,13 @@ import path from "node:path";
 import os from "node:os";
 
 import { parseArgs, HELP, type Config } from "./config.js";
-import { triage, type TriageResult } from "./triage.js";
-import { newTicket, appendTicket, parseTicket, type Ticket } from "./ticket.js";
-import { pollInbox, markSeen, sendReply, loadEmailConfig, SAMPLE_EMAIL_CONFIG, type EmailConfig, type FetchedEmail } from "./email.js";
+import { parseTicket, loadTickets, type Ticket, type TicketStatus } from "./ticket.js";
+import { handleInbound, type PipelineDeps } from "./pipeline.js";
+import { loadEmailConfig, SAMPLE_EMAIL_CONFIG } from "./email.js";
+import { EmailChannel } from "./channels/email.js";
+import { WebChannel } from "./channels/web.js";
+import { HttpServer } from "./server.js";
+import type { Channel, InboundMessage } from "./channels/types.js";
 
 const VERSION = "0.1.0";
 
@@ -28,45 +32,27 @@ function makeClient(config: Config): Anthropic {
   return new Anthropic(opts);
 }
 
-// Route a Tier-3 escalation into arnie's --serve queue (<dir>/inbox/<id>.task).
-async function routeToArnie(config: Config, ticket: Ticket, brief: string): Promise<string | null> {
-  if (!config.arnieQueue) return null;
-  const inbox = path.join(config.arnieQueue, "inbox");
-  await fsp.mkdir(inbox, { recursive: true }).catch(() => {});
-  const file = path.join(inbox, `${ticket.id}.task`);
-  const task = `[escalated by Casey — ticket ${ticket.id}, client ${ticket.from}]\n\n${brief}`;
-  await fsp.writeFile(file, task, "utf8");
-  return file;
+function makeDeps(config: Config, client: Anthropic): PipelineDeps {
+  return {
+    client,
+    model: config.model,
+    ticketStore: config.ticketStore,
+    arnieQueue: config.arnieQueue,
+    log: (line) => console.log(chalk.dim(line)),
+  };
 }
 
 const TIER_COLOR: Record<number, (s: string) => string> = { 1: chalk.green, 2: chalk.yellow, 3: chalk.red };
-const ACTION_LABEL: Record<string, string> = {
-  resolve: "RESOLVE (Tier-1)",
-  ask_client: "ASK CLIENT (Tier-1)",
-  escalate: "ESCALATE → arnie (Tier-3)",
+const STATUS_LABEL: Record<TicketStatus, string> = {
+  new: chalk.dim("new"),
+  resolved: chalk.green("RESOLVED (Tier-1)"),
+  awaiting_client: chalk.yellow("AWAITING CLIENT (Tier-1)"),
+  troubleshooting: chalk.yellow("TROUBLESHOOTING (Tier-2)"),
+  escalated: chalk.red("ESCALATED → arnie (Tier-3)"),
 };
 
 function indent(s: string): string {
   return s.split("\n").map((l) => "  " + l).join("\n");
-}
-
-function printTriage(t: TriageResult): void {
-  const tc = TIER_COLOR[t.tier] ?? chalk.white;
-  console.log(chalk.bold("\nTriage"));
-  console.log(`  category : ${t.category}`);
-  console.log(`  priority : ${t.priority}`);
-  console.log(`  tier     : ${tc(`T${t.tier}`)}`);
-  console.log(`  action   : ${chalk.bold(ACTION_LABEL[t.action] ?? t.action)}`);
-  console.log(`  summary  : ${t.summary}`);
-  if (t.missing_info.length) console.log(`  need     : ${t.missing_info.join("; ")}`);
-  console.log(chalk.bold("\nClient reply"));
-  console.log(chalk.dim("  ┄┄┄"));
-  console.log(chalk.cyan(indent(t.client_reply)));
-  console.log(chalk.dim("  ┄┄┄"));
-  if (t.action === "escalate" && t.escalation_brief) {
-    console.log(chalk.bold("\nEscalation brief → arnie (Tier-3)"));
-    console.log(indent(t.escalation_brief));
-  }
 }
 
 async function readStdin(): Promise<string> {
@@ -83,94 +69,147 @@ async function cmdTriage(config: Config, args: string[]): Promise<void> {
   }
   const content = src === "-" ? await readStdin() : await fsp.readFile(src, "utf8");
   const incoming = parseTicket(content);
-  const ticket = newTicket(incoming);
-  console.log(chalk.dim(`ticket ${ticket.id} — from ${ticket.from} — "${ticket.subject}"`));
+  const conversationId = `cli:${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+  const msg: InboundMessage = {
+    channel: "cli",
+    conversationId,
+    from: incoming.from,
+    subject: incoming.subject,
+    text: incoming.body,
+  };
+  console.log(chalk.dim(`ticket from ${incoming.from} — "${incoming.subject}"`));
 
   const client = makeClient(config);
-  const result = await triage(client, config.model, incoming);
-  ticket.triage = result;
-  printTriage(result);
+  const out = await handleInbound(makeDeps(config, client), msg);
 
-  if (result.action === "escalate") {
-    const routed = await routeToArnie(config, ticket, result.escalation_brief ?? result.summary);
-    ticket.status = "escalated";
-    ticket.routed_to = routed ?? undefined;
-    if (routed) console.log(chalk.cyan(`\n→ routed to arnie: ${routed}`));
-    else console.log(chalk.yellow("\n(no --arnie-queue set — escalation logged but not routed; pass --arnie-queue <dir>)"));
-  } else if (result.action === "ask_client") {
-    ticket.status = "awaiting_client";
-  } else {
-    ticket.status = "resolved";
+  const ticket = (await loadTickets(config.ticketStore)).find((t) => t.conversationId === conversationId);
+  if (ticket?.triage) {
+    const t = ticket.triage;
+    const tc = TIER_COLOR[t.tier] ?? chalk.white;
+    console.log(chalk.bold("\nTriage"));
+    console.log(`  category : ${t.category}`);
+    console.log(`  priority : ${t.priority}`);
+    console.log(`  tier     : ${tc(`T${t.tier}`)}`);
+    console.log(`  summary  : ${t.summary}`);
+  }
+  console.log(chalk.bold("\nOutcome  ") + (ticket ? STATUS_LABEL[ticket.status] : "?"));
+  if (out) {
+    console.log(chalk.dim("  ┄┄┄"));
+    console.log(chalk.cyan(indent(out.text)));
+    console.log(chalk.dim("  ┄┄┄"));
+  }
+  if (ticket?.routed_to) console.log(chalk.cyan(`\n→ routed to arnie: ${ticket.routed_to}`));
+  console.log(chalk.dim(`\nlogged → ${config.ticketStore}`));
+}
+
+/** Assemble the enabled channels for `serve`. */
+async function buildChannels(config: Config): Promise<Channel[]> {
+  const channels: Channel[] = [];
+
+  const cfgPath = config.emailConfig ?? path.join(os.homedir(), ".casey", "email.json");
+  try {
+    const email = await loadEmailConfig(cfgPath);
+    channels.push(new EmailChannel(email));
+    console.log(chalk.dim(`  email: ${email.imap.user} (${email.mailbox}), poll ${config.serveInterval}s`));
+  } catch (e) {
+    if (config.emailConfig) {
+      // Explicitly pointed at a config that failed to load — that's an error.
+      console.error(chalk.red(`  email: couldn't load ${cfgPath}: ${e instanceof Error ? e.message : String(e)}`));
+    }
+    // Otherwise email just isn't configured — skip it silently.
   }
 
-  await appendTicket(config.ticketStore, ticket);
-  console.log(chalk.dim(`\nlogged → ${config.ticketStore}  (status: ${ticket.status})`));
+  if (config.web) {
+    channels.push(new WebChannel());
+    console.log(chalk.dim(`  web:   http://127.0.0.1:${config.port}/ (chat widget) + POST /webhook (universal)`));
+  }
+
+  return channels;
 }
 
 async function cmdServe(config: Config): Promise<void> {
-  const cfgPath = config.emailConfig ?? path.join(os.homedir(), ".casey", "email.json");
-  let email: EmailConfig;
-  try {
-    email = await loadEmailConfig(cfgPath);
-  } catch (e) {
-    console.error(chalk.red(`serve: couldn't load email config from ${cfgPath}`));
-    console.error(chalk.dim(`  ${e instanceof Error ? e.message : String(e)}`));
-    console.error(chalk.dim("  run `casey email-config` for a template, then save it there (or pass --email-config <path>)."));
+  const client = makeClient(config);
+  const deps = makeDeps(config, client);
+  console.log(chalk.dim("serve: starting service desk — Ctrl+C to stop"));
+
+  const channels = await buildChannels(config);
+  if (!channels.length) {
+    console.error(chalk.red("serve: no channels enabled. Configure email (~/.casey/email.json) or pass --web."));
     process.exit(1);
   }
-  const client = makeClient(config);
-  console.log(chalk.dim(`serve: polling ${email.imap.user} (${email.mailbox}) every ${config.serveInterval}s — Ctrl+C to stop`));
   if (config.arnieQueue) console.log(chalk.dim(`  Tier-3 escalations → ${path.join(config.arnieQueue, "inbox")}`));
 
+  const pushChannels = channels.filter((c) => c.kind === "push");
+  const pollChannels = channels.filter((c) => c.kind === "poll");
+
+  let server: HttpServer | undefined;
+  if (pushChannels.length) {
+    server = new HttpServer();
+    for (const ch of pushChannels) {
+      ch.register?.(server, async (m) => {
+        console.log(chalk.cyan(`\n[${m.channel}] ${m.from}${m.subject ? ` — "${m.subject}"` : ""}`));
+        const out = await handleInbound(deps, m);
+        // Async push channels (e.g. Slack) deliver via reply(); synchronous ones
+        // (web/webhook) return the reply in the HTTP response, so reply() is a no-op.
+        if (out) await ch.reply(out);
+        return out;
+      });
+    }
+    await server.start(config.port);
+  }
+
   let stop = false;
+  let resolveStop: () => void = () => {};
+  const stopPromise = new Promise<void>((r) => (resolveStop = r));
   process.on("SIGINT", () => {
-    console.log(chalk.dim("\nserve: stopping after this cycle..."));
-    stop = true;
+    if (!stop) {
+      stop = true;
+      console.log(chalk.dim("\nserve: stopping…"));
+      resolveStop();
+    }
   });
 
-  while (!stop) {
-    let emails: FetchedEmail[] = [];
-    try {
-      emails = await pollInbox(email);
-    } catch (e) {
-      console.error(chalk.red(`  inbox poll failed: ${e instanceof Error ? e.message : String(e)}`));
-    }
-    const done: number[] = [];
-    for (const em of emails) {
-      if (stop) break;
-      const ticket = newTicket(em);
-      console.log(chalk.cyan(`\n[${ticket.id}] ${em.from} — "${em.subject}"`));
-      try {
-        const result = await triage(client, config.model, em);
-        ticket.triage = result;
-        console.log(`  ${result.category}/${result.priority}/T${result.tier} → ${ACTION_LABEL[result.action] ?? result.action}`);
-        await sendReply(email, { to: em.from, subject: em.subject, body: result.client_reply, inReplyTo: em.messageId });
-        console.log(chalk.dim(`  replied to ${em.from}`));
-        if (result.action === "escalate") {
-          const routed = await routeToArnie(config, ticket, result.escalation_brief ?? result.summary);
-          ticket.status = "escalated";
-          ticket.routed_to = routed ?? undefined;
-          console.log(routed ? chalk.cyan(`  → arnie: ${path.basename(routed)}`) : chalk.yellow("  (no --arnie-queue — escalation not routed)"));
-        } else {
-          ticket.status = result.action === "ask_client" ? "awaiting_client" : "resolved";
+  if (pollChannels.length === 0) {
+    await stopPromise; // push-only: idle until Ctrl+C
+  } else {
+    while (!stop) {
+      for (const ch of pollChannels) {
+        if (stop) break;
+        let msgs: InboundMessage[] = [];
+        try {
+          msgs = (await ch.receive?.()) ?? [];
+        } catch (e) {
+          console.error(chalk.red(`  ${ch.name} poll failed: ${e instanceof Error ? e.message : String(e)}`));
         }
-        done.push(em.uid);
-      } catch (e) {
-        console.error(chalk.red(`  failed: ${e instanceof Error ? e.message : String(e)} — leaving unread to retry`));
-        ticket.status = "new";
+        const handled: InboundMessage[] = [];
+        for (const m of msgs) {
+          if (stop) break;
+          console.log(chalk.cyan(`\n[${ch.name}] ${m.from} — "${m.subject ?? ""}"`));
+          try {
+            const out = await handleInbound(deps, m);
+            if (out) {
+              await ch.reply(out);
+              console.log(chalk.dim(`  replied to ${m.from}`));
+            }
+            handled.push(m);
+          } catch (e) {
+            console.error(chalk.red(`  failed: ${e instanceof Error ? e.message : String(e)} — leaving for retry`));
+          }
+        }
+        if (handled.length) {
+          try {
+            await ch.ack?.(handled);
+          } catch (e) {
+            console.error(chalk.red(`  ${ch.name} ack failed: ${e instanceof Error ? e.message : String(e)}`));
+          }
+        }
       }
-      await appendTicket(config.ticketStore, ticket);
+      if (stop) break;
+      await Promise.race([new Promise((r) => setTimeout(r, config.serveInterval * 1000)), stopPromise]);
     }
-    if (done.length) {
-      try {
-        await markSeen(email, done);
-      } catch (e) {
-        console.error(chalk.red(`  markSeen failed: ${e instanceof Error ? e.message : String(e)}`));
-      }
-    }
-    if (stop) break;
-    await new Promise((r) => setTimeout(r, config.serveInterval * 1000));
   }
+
+  if (server) await server.stop();
   console.log(chalk.dim("serve: stopped"));
 }
 

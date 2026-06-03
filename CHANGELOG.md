@@ -12,9 +12,14 @@ rename that heading to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh
 
 ## [0.1.0] - 2026-06-03
 
-Initial release — an AI IT service-desk CSR (Tier-1 intake + triage).
+Initial release — an omnichannel AI IT service desk (Tier-1 triage + Tier-2 guided troubleshooting), pairing with arnie (Tier-3).
 
-- `casey triage <file|->` triages one ticket (JSON or a plain email) into a structured decision: category, priority, tier, and an action — `resolve` / `ask_client` / `escalate` — each with a ready-to-send client reply.
-- `casey serve` runs the email daemon: polls an IMAP inbox, triages each new message, replies via SMTP, and routes Tier-3 escalations into arnie's `--serve` queue as task files — a hands-off Tier-1 → Tier-3 pipeline. Unhandled mail is left unread to retry.
-- Routes the LLM through dario (or any Anthropic-compatible endpoint) via `--dario`; structured output uses JSON-mode so it passes cleanly through dario's wire shape.
-- `casey email-config` prints a fillable IMAP/SMTP config template; every ticket is logged to `~/.casey/tickets.jsonl`.
+- **Channel-agnostic core.** Every channel is an adapter feeding one pipeline; tickets are handled the same regardless of origin and replies route back out the same channel.
+  - **Email** (IMAP poll + SMTP reply) — auto-on when `~/.casey/email.json` exists.
+  - **Web chat widget** — a self-contained live-chat page served at `/` (enable with `--web`).
+  - **Universal webhook** — `POST /webhook`; any system that speaks HTTP plugs in with no bespoke integration.
+- **Tier-1 triage** — classifies each request (category / priority / tier) and either resolves it with a complete reply or asks for the one missing detail.
+- **Tier-2 guided troubleshooting** — a multi-turn diagnostic conversation for problems a client can fix with guidance; tracks the thread by conversation id so a reply continues the same ticket; resolves or escalates with a richer brief.
+- **Tier-3 escalation** — drops a crisp technical brief into arnie's `--serve` queue for hands-on problems and site-wide outages.
+- `casey serve` runs every enabled channel at once (poll loop for email + HTTP server for web/webhook). `casey triage <file|->` triages/handles a single ticket for testing. `casey email-config` prints a fillable IMAP/SMTP template.
+- Routes the LLM through dario (or any Anthropic-compatible endpoint) via `--dario`; structured output uses JSON-mode so it passes cleanly through dario's wire shape. Every ticket + its conversation is logged to `~/.casey/tickets.jsonl`.

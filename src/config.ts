@@ -9,6 +9,8 @@ export interface Config {
   arnieQueue?: string; // dir for Tier-3 hand-offs; tasks land in <dir>/inbox (arnie --serve <dir>)
   emailConfig?: string; // path to email.json (default ~/.casey/email.json)
   serveInterval: number; // seconds between inbox polls in `serve`
+  web: boolean; // enable the web chat widget + universal webhook (HTTP push channel)
+  port: number; // HTTP port for push channels (web/webhook)
   showHelp: boolean;
   showVersion: boolean;
 }
@@ -18,6 +20,8 @@ const DEFAULTS: Config = {
   dario: false,
   ticketStore: path.join(os.homedir(), ".casey", "tickets.jsonl"),
   serveInterval: 30,
+  web: false,
+  port: 8787,
   showHelp: false,
   showVersion: false,
 };
@@ -65,6 +69,15 @@ export function parseArgs(argv: string[]): { config: Config; command: string; ar
         config.serveInterval = v;
         break;
       }
+      case "--web":
+        config.web = true;
+        break;
+      case "--port": {
+        const v = parseInt(next("--port"), 10);
+        if (!Number.isFinite(v) || v <= 0 || v > 65535) throw new Error("--port must be a port number (1-65535)");
+        config.port = v;
+        break;
+      }
       default:
         if (a.startsWith("-")) throw new Error(`unknown option: ${a}`);
         if (!command) command = a;
@@ -83,9 +96,16 @@ Commands:
                        or a plain email ("From: ...\\nSubject: ...\\n\\n<body>").
                        Prints the triage + the client reply; routes Tier-3 to arnie.
   triage -            Read the ticket from stdin.
-  serve                Email daemon: poll the inbox, triage each new mail, reply to
-                       the client, and route Tier-3 to arnie. Needs ~/.casey/email.json.
+  serve                Run the omnichannel service desk: take tickets in across every
+                       enabled channel, triage (Tier-1), troubleshoot (Tier-2), and
+                       escalate to arnie (Tier-3). Enable channels with the flags below
+                       — at least one of email (~/.casey/email.json) or --web.
   email-config         Print a sample email.json (IMAP + SMTP) to fill in.
+
+Channels (serve):
+  email                Auto-on when ~/.casey/email.json exists (or --email-config <f>).
+  --web                Web chat widget (GET /) + universal webhook (POST /webhook).
+  --port <n>           HTTP port for --web / webhook (default: 8787)
 
 Options:
   --dario              Route the LLM through a local dario proxy (localhost:3456)
