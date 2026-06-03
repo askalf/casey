@@ -1,0 +1,31 @@
+# Example: run casey alongside an existing dario container (a Claude-subscription
+# proxy) on the same Docker network — no per-token API billing. Run from the repo
+# root:  docker compose -f deploy/docker-compose.casey.yml up -d --build
+services:
+  casey:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: dario
+      ANTHROPIC_BASE_URL: http://dario:3456 # route the model through dario on this network
+      # Enable only for the channels you turn on in `command`:
+      # SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      # SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      # DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      # TEAMS_APP_ID: ${TEAMS_APP_ID}
+      # TEAMS_APP_PASSWORD: ${TEAMS_APP_PASSWORD}
+    command: ["serve", "--web", "--port", "8787", "--arnie-queue", "/agent-output/casey-queue"]
+    volumes:
+      - casey-data:/root/.casey # ticket store + conversations
+      - ./agent-output:/agent-output # shared Tier-3 queue with arnie (optional)
+    # Expose 8787 to your reverse proxy / Cloudflare tunnel for the
+    # web / webhook / slack / teams endpoints. Discord needs no inbound port.
+    # networks: [askalf]   # uncomment to join dario's network
+
+volumes:
+  casey-data:
+# networks:
+#   askalf:
+#     external: true
