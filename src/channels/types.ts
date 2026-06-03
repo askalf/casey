@@ -3,10 +3,12 @@
  * SMS, voice, …) implements this so the triage → troubleshoot → escalate
  * pipeline is identical regardless of where a ticket came in.
  *
- * Two kinds:
- *  - "poll"  channels pull new messages on a timer (e.g. email/IMAP) and ack them.
- *  - "push"  channels receive messages via the shared HTTP server (web widget,
- *            webhook, Slack events, Twilio SMS/voice webhooks) and register routes.
+ * Three kinds:
+ *  - "poll"       channels pull new messages on a timer (e.g. email/IMAP) and ack them.
+ *  - "push"       channels receive messages via the shared HTTP server (web widget,
+ *                 webhook, Slack events, Teams, Twilio SMS/voice) and register routes.
+ *  - "connection" channels hold a long-lived connection (e.g. the Discord gateway
+ *                 WebSocket): listen() opens it and drives the handler itself.
  */
 
 export interface InboundMessage {
@@ -65,7 +67,7 @@ export type InboundHandler = (msg: InboundMessage) => Promise<OutboundMessage | 
 
 export interface Channel {
   readonly name: string;
-  readonly kind: "poll" | "push";
+  readonly kind: "poll" | "push" | "connection";
 
   /** Send a reply back out through this channel. */
   reply(out: OutboundMessage): Promise<void>;
@@ -77,10 +79,18 @@ export interface Channel {
 
   /**
    * push channels: register HTTP routes on the shared server. The adapter parses
-   * each request into an InboundMessage, calls `handle`, and — for synchronous
-   * channels like the web widget — returns the reply in the HTTP response.
+   * each request into an InboundMessage, calls `handle`, and either returns the
+   * reply in the HTTP response (web) or acks fast and delivers the reply itself
+   * via reply() (Slack/Teams, which require a quick ack then an async API call).
    */
   register?(server: ChannelServer, handle: InboundHandler): void;
+
+  /**
+   * connection channels: open a long-lived connection (e.g. the Discord gateway)
+   * and drive `handle` on each inbound message, delivering replies via reply().
+   * Resolves once the connection is established; runs until stop().
+   */
+  listen?(handle: InboundHandler): Promise<void>;
 
   /** Optional lifecycle hooks (open IMAP connection, validate creds, close sockets). */
   start?(): Promise<void>;

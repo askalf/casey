@@ -18,6 +18,7 @@ Initial release — an omnichannel AI IT service desk (Tier-1 triage + Tier-2 gu
   - **Email** (IMAP poll + SMTP reply) — auto-on when `~/.casey/email.json` exists.
   - **Web chat widget** — a self-contained live-chat page served at `/` (enable with `--web`).
   - **Universal webhook** — `POST /webhook`; any system that speaks HTTP plugs in with no bespoke integration.
+  - **Slack** (`--slack`, Events API), **Discord** (`--discord`, gateway), **Microsoft Teams** (`--teams`, Bot Framework) — chat-platform adapters; credentials via env. Adapter-complete + offline-tested; live-validated on provisioning each platform's credentials.
 - **Tier-1 triage** — classifies each request (category / priority / tier) and either resolves it with a complete reply or asks for the one missing detail.
 - **Tier-2 guided troubleshooting** — a multi-turn diagnostic conversation for problems a client can fix with guidance; tracks the thread by conversation id so a reply continues the same ticket; resolves or escalates with a richer brief.
 - **Tier-3 escalation** — drops a crisp technical brief into arnie's `--serve` queue for hands-on problems and site-wide outages.

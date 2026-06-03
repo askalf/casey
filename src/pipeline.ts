@@ -42,6 +42,8 @@ function outbound(msg: InboundMessage, text: string): OutboundMessage {
     subject: msg.subject,
     text,
     ref: msg.ref,
+    // Carry channel-specific routing (slack channel/thread, teams serviceUrl, …) so reply() can deliver.
+    meta: msg.meta,
   };
 }
 

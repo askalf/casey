@@ -23,15 +23,17 @@ The deciding question between Tier-2 and Tier-3 is *who can act*: if a single us
 
 ## Channels
 
-| Channel | Status | Notes |
+| Channel | Status | Enable with |
 |---|---|---|
-| **Email** (IMAP/SMTP) | ✅ | Any provider — Gmail app-password, Microsoft 365, generic IMAP. |
-| **Web chat widget** | ✅ | Embeddable live-chat page served at `/`; clients chat with casey in real time. |
-| **Universal webhook** | ✅ | `POST /webhook` — any system that speaks HTTP (forms, Zapier, SMS gateways, custom apps) plugs in with no bespoke integration. |
-| Slack / Teams / Discord | 🚧 | Chat platforms — adapters on the roadmap. |
-| SMS / Voice | 🚧 | Twilio adapters on the roadmap. |
+| **Email** (IMAP/SMTP) | ✅ live | auto-on with `~/.casey/email.json` — Gmail app-password, Microsoft 365, generic IMAP |
+| **Web chat widget** | ✅ live | `--web` — embeddable live-chat page at `/` |
+| **Universal webhook** | ✅ live | `--web` — `POST /webhook`, any HTTP source (forms, Zapier, gateways, apps) |
+| **Slack** | ✅ built | `--slack` + `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` |
+| **Discord** | ✅ built | `--discord` + `DISCORD_BOT_TOKEN` |
+| **Microsoft Teams** | ✅ built | `--teams` + `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD` |
+| SMS / Voice | 🚧 roadmap | Twilio adapters (Phase 3) |
 
-New channels are just an adapter that implements the `Channel` interface (`receive` → `reply`); the triage → troubleshoot → escalate pipeline doesn't change.
+*✅ built* = adapter complete and offline-tested; live-validated once you provision that platform's credentials. New channels are just an adapter that implements the `Channel` interface (`receive`/`listen` → `reply`); the triage → troubleshoot → escalate pipeline doesn't change.
 
 ## Install
 
@@ -81,6 +83,22 @@ curl -sX POST http://127.0.0.1:8787/webhook \
 
 Anything that can POST JSON becomes a channel. Pass a stable `conversationId` to keep a thread together across messages.
 
+### Chat channels (Slack / Discord / Teams)
+
+Each chat platform is a `Channel` adapter enabled by a flag; credentials come from the environment. They need a publicly reachable host for their webhooks/gateway (see "go live").
+
+```
+SLACK_BOT_TOKEN=xoxb-…  SLACK_SIGNING_SECRET=…  casey serve --slack --dario
+DISCORD_BOT_TOKEN=…                              casey serve --discord --dario
+TEAMS_APP_ID=…  TEAMS_APP_PASSWORD=…             casey serve --teams --dario
+```
+
+- **Slack** — create a Slack app, add a bot token (`chat:write`, `app_mentions:read`, message-history scopes), subscribe to message events, and point the Events API Request URL at `https://<host>/slack/events`. The signing secret verifies each request.
+- **Discord** — create an application + bot, enable the **Message Content** intent, and invite it with *Send Messages* + *Read Message History*. It connects over the gateway (no public URL needed for intake; replies go via the REST API).
+- **Microsoft Teams** — register an Azure Bot, add the Teams channel, and set the messaging endpoint to `https://<host>/teams/messages`. Replies use an app-credentials token against the Bot Framework connector.
+
+All flags compose — `casey serve --web --slack --discord --teams --dario` runs every channel against one pipeline at once.
+
 ## Configuration
 
 `~/.casey/email.json` (print a template with `casey email-config`):
@@ -103,7 +121,10 @@ Credentials stay in this local file — they're never sent anywhere but your mai
 --base-url <url>     Anthropic-compatible endpoint
 --model <id>         Model (default: claude-opus-4-7)
 --web                Enable the web chat widget (GET /) + universal webhook (POST /webhook)
---port <n>           HTTP port for --web / webhook (default: 8787)
+--slack              Slack Events API channel   (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)
+--discord            Discord gateway bot        (env: DISCORD_BOT_TOKEN)
+--teams              MS Teams Bot Framework      (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD)
+--port <n>           HTTP port for web/webhook/slack/teams (default: 8787)
 --arnie-queue <dir>  Drop Tier-3 hand-offs into <dir>/inbox as arnie *.task files
 --email-config <f>   Path to the IMAP/SMTP config (default: ~/.casey/email.json)
 --interval <sec>     Seconds between inbox polls in serve (default: 30)

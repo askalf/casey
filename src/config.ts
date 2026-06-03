@@ -10,7 +10,10 @@ export interface Config {
   emailConfig?: string; // path to email.json (default ~/.casey/email.json)
   serveInterval: number; // seconds between inbox polls in `serve`
   web: boolean; // enable the web chat widget + universal webhook (HTTP push channel)
-  port: number; // HTTP port for push channels (web/webhook)
+  port: number; // HTTP port for push channels (web/webhook/slack/teams)
+  slack: boolean; // Slack Events API (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)
+  discord: boolean; // Discord gateway (env: DISCORD_BOT_TOKEN)
+  teams: boolean; // MS Teams Bot Framework (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD)
   showHelp: boolean;
   showVersion: boolean;
 }
@@ -22,6 +25,9 @@ const DEFAULTS: Config = {
   serveInterval: 30,
   web: false,
   port: 8787,
+  slack: false,
+  discord: false,
+  teams: false,
   showHelp: false,
   showVersion: false,
 };
@@ -72,6 +78,15 @@ export function parseArgs(argv: string[]): { config: Config; command: string; ar
       case "--web":
         config.web = true;
         break;
+      case "--slack":
+        config.slack = true;
+        break;
+      case "--discord":
+        config.discord = true;
+        break;
+      case "--teams":
+        config.teams = true;
+        break;
       case "--port": {
         const v = parseInt(next("--port"), 10);
         if (!Number.isFinite(v) || v <= 0 || v > 65535) throw new Error("--port must be a port number (1-65535)");
@@ -105,7 +120,10 @@ Commands:
 Channels (serve):
   email                Auto-on when ~/.casey/email.json exists (or --email-config <f>).
   --web                Web chat widget (GET /) + universal webhook (POST /webhook).
-  --port <n>           HTTP port for --web / webhook (default: 8787)
+  --slack              Slack Events API (env: SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET).
+  --discord            Discord gateway bot (env: DISCORD_BOT_TOKEN).
+  --teams              MS Teams Bot Framework (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD).
+  --port <n>           HTTP port for web/webhook/slack/teams endpoints (default: 8787)
 
 Options:
   --dario              Route the LLM through a local dario proxy (localhost:3456)

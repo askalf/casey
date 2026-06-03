@@ -14,9 +14,13 @@ import {
 import { triageSchema } from "./triage.js";
 import { troubleshootSchema } from "./troubleshoot.js";
 import { extractJson } from "./llm.js";
+import { createHmac } from "node:crypto";
 import { emailConversationId } from "./channels/email.js";
 import { WebChannel } from "./channels/web.js";
-import type { ChannelServer, ServerRequest, ServerResponse } from "./channels/types.js";
+import { SlackChannel } from "./channels/slack.js";
+import { TeamsChannel } from "./channels/teams.js";
+import { DiscordChannel } from "./channels/discord.js";
+import type { ChannelServer, ServerRequest, ServerResponse, InboundMessage } from "./channels/types.js";
 
 interface Case {
   name: string;
@@ -167,6 +171,84 @@ async function webChannelTests(): Promise<void> {
   check("web: invalid JSON → 400", badJson.status === 400);
 }
 
+function signSlack(secret: string, ts: string, body: string): string {
+  return "v0=" + createHmac("sha256", secret).update(`v0:${ts}:${body}`).digest("hex");
+}
+
+async function slackTests(): Promise<void> {
+  const secret = "shhh-signing-secret";
+  const slack = new SlackChannel("xoxb-test", secret);
+  const server = new MockServer();
+  const got: InboundMessage[] = [];
+  slack.register(server, async (m) => {
+    got.push(m);
+    return null;
+  });
+  check("slack: registers events endpoint", server.routes.has("POST /slack/events"));
+  const post = server.routes.get("POST /slack/events")!;
+  const ts = String(Math.floor(Date.now() / 1000));
+
+  const challengeBody = JSON.stringify({ type: "url_verification", challenge: "ch-123" });
+  const ch = await post({
+    method: "POST", path: "/slack/events", query: {},
+    headers: { "x-slack-request-timestamp": ts, "x-slack-signature": signSlack(secret, ts, challengeBody) },
+    body: challengeBody,
+  });
+  check("slack: url_verification echoes challenge", ch.status === 200 && JSON.parse(ch.body).challenge === "ch-123", ch.body);
+
+  const evBody = JSON.stringify({
+    type: "event_callback", event_id: "Ev1",
+    event: { type: "message", user: "U1", channel: "C1", ts: "1700.1", text: "my vpn is down" },
+  });
+  const ev = await post({
+    method: "POST", path: "/slack/events", query: {},
+    headers: { "x-slack-request-timestamp": ts, "x-slack-signature": signSlack(secret, ts, evBody) },
+    body: evBody,
+  });
+  const sm = got[0];
+  check(
+    "slack: signed message event acked + parsed",
+    ev.status === 200 && got.length === 1 && sm?.channel === "slack" && sm?.conversationId === "slack:C1:1700.1" && sm?.text === "my vpn is down",
+    JSON.stringify(sm ?? null),
+  );
+
+  const bad = await post({
+    method: "POST", path: "/slack/events", query: {},
+    headers: { "x-slack-request-timestamp": ts, "x-slack-signature": "v0=deadbeef" },
+    body: evBody,
+  });
+  check("slack: bad signature → 401", bad.status === 401);
+}
+
+async function teamsTests(): Promise<void> {
+  const teams = new TeamsChannel("app-id", "app-pass");
+  const server = new MockServer();
+  const got: InboundMessage[] = [];
+  teams.register(server, async (m) => {
+    got.push(m);
+    return null;
+  });
+  check("teams: registers messages endpoint", server.routes.has("POST /teams/messages"));
+  const post = server.routes.get("POST /teams/messages")!;
+  const body = JSON.stringify({
+    type: "message", text: "printer offline", id: "act1",
+    from: { id: "u9", name: "Dana" }, conversation: { id: "19:meeting_abc" },
+    serviceUrl: "https://smba.trafficmanager.net/",
+  });
+  const res = await post({ method: "POST", path: "/teams/messages", query: {}, headers: {}, body });
+  const tm = got[0];
+  check(
+    "teams: activity acked + parsed",
+    res.status === 200 && got.length === 1 && tm?.channel === "teams" && tm?.conversationId === "teams:19:meeting_abc" && tm?.from === "u9" && tm?.meta?.serviceUrl === "https://smba.trafficmanager.net/",
+    JSON.stringify(tm ?? null),
+  );
+}
+
+function discordTests(): void {
+  const d = new DiscordChannel("bot-token");
+  check("discord: constructs as a connection channel", d.name === "discord" && d.kind === "connection");
+}
+
 async function main(): Promise<void> {
   parseTests();
   schemaTests();
@@ -175,6 +257,9 @@ async function main(): Promise<void> {
   emailConvTests();
   await storeTests();
   await webChannelTests();
+  await slackTests();
+  await teamsTests();
+  discordTests();
 
   console.log("\n" + "=".repeat(60));
   console.log("CASEY TESTS");

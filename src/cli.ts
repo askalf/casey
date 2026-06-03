@@ -12,6 +12,9 @@ import { handleInbound, type PipelineDeps } from "./pipeline.js";
 import { loadEmailConfig, SAMPLE_EMAIL_CONFIG } from "./email.js";
 import { EmailChannel } from "./channels/email.js";
 import { WebChannel } from "./channels/web.js";
+import { SlackChannel } from "./channels/slack.js";
+import { DiscordChannel } from "./channels/discord.js";
+import { TeamsChannel } from "./channels/teams.js";
 import { HttpServer } from "./server.js";
 import type { Channel, InboundMessage } from "./channels/types.js";
 
@@ -124,6 +127,38 @@ async function buildChannels(config: Config): Promise<Channel[]> {
     console.log(chalk.dim(`  web:   http://127.0.0.1:${config.port}/ (chat widget) + POST /webhook (universal)`));
   }
 
+  if (config.slack) {
+    const token = process.env.SLACK_BOT_TOKEN;
+    const secret = process.env.SLACK_SIGNING_SECRET;
+    if (token && secret) {
+      channels.push(new SlackChannel(token, secret));
+      console.log(chalk.dim(`  slack: POST /slack/events`));
+    } else {
+      console.error(chalk.red("  slack: --slack set but SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET missing — skipping"));
+    }
+  }
+
+  if (config.discord) {
+    const token = process.env.DISCORD_BOT_TOKEN;
+    if (token) {
+      channels.push(new DiscordChannel(token));
+      console.log(chalk.dim(`  discord: gateway bot`));
+    } else {
+      console.error(chalk.red("  discord: --discord set but DISCORD_BOT_TOKEN missing — skipping"));
+    }
+  }
+
+  if (config.teams) {
+    const id = process.env.TEAMS_APP_ID;
+    const pass = process.env.TEAMS_APP_PASSWORD;
+    if (id && pass) {
+      channels.push(new TeamsChannel(id, pass));
+      console.log(chalk.dim(`  teams: POST /teams/messages`));
+    } else {
+      console.error(chalk.red("  teams: --teams set but TEAMS_APP_ID / TEAMS_APP_PASSWORD missing — skipping"));
+    }
+  }
+
   return channels;
 }
 
@@ -141,22 +176,20 @@ async function cmdServe(config: Config): Promise<void> {
 
   const pushChannels = channels.filter((c) => c.kind === "push");
   const pollChannels = channels.filter((c) => c.kind === "poll");
+  const connChannels = channels.filter((c) => c.kind === "connection");
 
+  // Push channels (web/webhook/slack/teams) register routes on a shared HTTP server.
+  // Each manages its own reply: web returns it in the HTTP response; slack/teams ack
+  // fast then reply via their API — so the pipeline is passed straight through.
   let server: HttpServer | undefined;
   if (pushChannels.length) {
     server = new HttpServer();
-    for (const ch of pushChannels) {
-      ch.register?.(server, async (m) => {
-        console.log(chalk.cyan(`\n[${m.channel}] ${m.from}${m.subject ? ` — "${m.subject}"` : ""}`));
-        const out = await handleInbound(deps, m);
-        // Async push channels (e.g. Slack) deliver via reply(); synchronous ones
-        // (web/webhook) return the reply in the HTTP response, so reply() is a no-op.
-        if (out) await ch.reply(out);
-        return out;
-      });
-    }
+    for (const ch of pushChannels) ch.register?.(server, (m) => handleInbound(deps, m));
     await server.start(config.port);
   }
+
+  // Connection channels (the Discord gateway) open their own long-lived connection.
+  for (const ch of connChannels) await ch.listen?.((m) => handleInbound(deps, m));
 
   let stop = false;
   let resolveStop: () => void = () => {};
@@ -209,6 +242,13 @@ async function cmdServe(config: Config): Promise<void> {
     }
   }
 
+  for (const ch of channels) {
+    try {
+      await ch.stop?.();
+    } catch {
+      /* ignore shutdown errors */
+    }
+  }
   if (server) await server.stop();
   console.log(chalk.dim("serve: stopped"));
 }
