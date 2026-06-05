@@ -1,6 +1,6 @@
 {
   "name": "casey-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI IT service-desk CSR — intakes client tickets (email), triages by category/priority/tier, resolves Tier-1 itself, and routes technical issues to arnie (Tier-3). Pairs with arnie-cli; routes LLM calls through dario.",
   "keywords": [
     "it",

@@ -20,7 +20,7 @@ import { VoiceChannel } from "./channels/voice.js";
 import { HttpServer } from "./server.js";
 import type { Channel, InboundMessage } from "./channels/types.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 function makeClient(config: Config): Anthropic {
   if (config.dario) {

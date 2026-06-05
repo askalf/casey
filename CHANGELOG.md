@@ -10,9 +10,11 @@ rename that heading to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-06-03
+## [0.1.1] - 2026-06-05
 
-Initial release — an omnichannel AI IT service desk (Tier-1 triage + Tier-2 guided troubleshooting), pairing with arnie (Tier-3).
+First npm release — an omnichannel AI IT service desk (Tier-1 triage + Tier-2 guided troubleshooting), pairing with arnie (Tier-3).
+
+- **Packaging** — npm metadata (`repository`/`homepage`/`bugs`); docs corrected so arnie's `--serve` points at `<queue>/inbox` (casey writes briefs there; arnie reads `*.task` flat).
 
 - **Channel-agnostic core.** Every channel is an adapter feeding one pipeline; tickets are handled the same regardless of origin and replies route back out the same channel.
   - **Email** (IMAP poll + SMTP reply) — auto-on when `~/.casey/email.json` exists.
