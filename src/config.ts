@@ -142,7 +142,7 @@ Options:
   --base-url <url>     Anthropic-compatible endpoint
   --model <id>         Model (default: claude-opus-4-7)
   --arnie-queue <dir>  Drop Tier-3 hand-offs into <dir>/inbox as arnie *.task files
-                       (run the fixer with: arnie --serve <dir> --autonomous)
+                       (run the fixer with: arnie --serve <dir>/inbox --autonomous)
   --email-config <f>   Path to the IMAP/SMTP config (default: ~/.casey/email.json)
   --interval <sec>     Seconds between inbox polls in serve (default: 30)
   --ticket-store <f>   Ticket log JSONL (default: ~/.casey/tickets.jsonl)
