@@ -63,11 +63,11 @@ casey serve --web --dario --arnie-queue ./queue
 casey email-config > ~/.casey/email.json     # then fill in your support inbox
 casey serve --web --dario --arnie-queue ./queue
 
-# the Tier-3 fixer, alongside
-arnie --serve ./queue --autonomous
+# the Tier-3 fixer, alongside — casey writes briefs to ./queue/inbox, so point arnie there
+arnie --serve ./queue/inbox --autonomous
 ```
 
-`serve` runs every enabled channel at once: it polls the inbox, serves the web widget + webhook, triages and troubleshoots each request, replies through the originating channel, and drops Tier-3 escalations into `./queue/inbox` as arnie task files. Point arnie's `--serve` at the same directory and the tiers run hands-off.
+`serve` runs every enabled channel at once: it polls the inbox, serves the web widget + webhook, triages and troubleshoots each request, replies through the originating channel, and drops Tier-3 escalations into `./queue/inbox` as arnie task files. Point arnie's `--serve` at that `./queue/inbox` directory (arnie reads `*.task` flat, so give it the `inbox` path, not the queue root) and the tiers run hands-off.
 
 ### The web widget
 

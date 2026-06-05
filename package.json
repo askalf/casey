@@ -18,6 +18,12 @@
   ],
   "author": "askalf (https://github.com/askalf)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/askalf/casey.git"
+  },
+  "homepage": "https://github.com/askalf/casey#readme",
+  "bugs": "https://github.com/askalf/casey/issues",
   "type": "module",
   "bin": {
     "casey": "dist/cli.js"
