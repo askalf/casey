@@ -334,6 +334,7 @@ async function consoleTests(): Promise<void> {
   const cstore = path.join(os.tmpdir(), `casey-console-c-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const pstore = path.join(os.tmpdir(), `casey-console-p-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const gstore = path.join(os.tmpdir(), `casey-console-g-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
+  const rfile = path.join(os.tmpdir(), `casey-console-r-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.json`);
   const get = (p: string, query: Record<string, string> = {}): ServerRequest => ({ method: "GET", path: p, query, headers: {}, body: "" });
   const post = (p: string, body: unknown): ServerRequest => ({ method: "POST", path: p, query: {}, headers: {}, body: JSON.stringify(body) });
   try {
@@ -347,7 +348,7 @@ async function consoleTests(): Promise<void> {
     await saveTicket(store, b);
 
     const server = new MockServer();
-    registerConsole(server, { ticketStore: store, clientStore: cstore, projectStore: pstore, graduationStore: gstore, arnieQueue: queue, darioUrl: undefined });
+    registerConsole(server, { ticketStore: store, clientStore: cstore, projectStore: pstore, graduationStore: gstore, rolesFile: rfile, trustAccessHeader: false, arnieQueue: queue, darioUrl: undefined });
 
     check(
       "console: registers page + api routes",
@@ -358,7 +359,8 @@ async function consoleTests(): Promise<void> {
         server.routes.has("POST /api/ticket/reject") && server.routes.has("GET /api/clients") &&
         server.routes.has("POST /api/clients") && server.routes.has("POST /api/client/asset") &&
         server.routes.has("POST /api/ticket/client") && server.routes.has("POST /api/ticket/assign") &&
-        server.routes.has("POST /api/ticket/time") && server.routes.has("POST /api/ticket/procurement"),
+        server.routes.has("POST /api/ticket/time") && server.routes.has("POST /api/ticket/procurement") &&
+        server.routes.has("GET /api/me"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -507,12 +509,31 @@ async function consoleTests(): Promise<void> {
     const promoRes = await server.routes.get("POST /api/graduation/promote")!(post("/api/graduation/promote", { key: "network", auto: true }));
     const grad2 = JSON.parse((await server.routes.get("GET /api/graduations")!(get("/api/graduations"))).body) as { patterns: Array<{ key: string; promoted: boolean }> };
     check("console: promote marks a pattern auto", promoRes.status === 200 && !!grad2.patterns.find((p) => p.key === "network" && p.promoted));
+
+    // identity / CF Access (this console has trust OFF)
+    const meOff = JSON.parse((await server.routes.get("GET /api/me")!(get("/api/me"))).body) as { email: string | null; trusted: boolean };
+    check("console: /api/me has no identity when trust is off", meOff.email === null && meOff.trusted === false);
+
+    // a second console WITH trust on + a roles map
+    await fsp.writeFile(rfile, JSON.stringify({ "alex@msp.com": "dispatch" }), "utf8");
+    const server2 = new MockServer();
+    registerConsole(server2, { ticketStore: store, clientStore: cstore, projectStore: pstore, graduationStore: gstore, rolesFile: rfile, trustAccessHeader: true, arnieQueue: queue, darioUrl: undefined });
+    const meReq = (email?: string): ServerRequest => ({ method: "GET", path: "/api/me", query: {}, headers: email ? { "cf-access-authenticated-user-email": email } : {}, body: "" });
+    const meOn = JSON.parse((await server2.routes.get("GET /api/me")!(meReq("alex@msp.com"))).body) as { email: string; role: string; trusted: boolean };
+    check("console: /api/me resolves CF Access email → role", meOn.email === "alex@msp.com" && meOn.role === "dispatch" && meOn.trusted === true, JSON.stringify(meOn));
+    const meNoHdr = JSON.parse((await server2.routes.get("GET /api/me")!(meReq())).body) as { email: string | null };
+    check("console: /api/me null when trusted but header absent", meNoHdr.email === null);
+    const apReq: ServerRequest = { method: "POST", path: "/api/ticket/approve", query: {}, headers: { "cf-access-authenticated-user-email": "alex@msp.com" }, body: JSON.stringify({ id: b.id }) };
+    await server2.routes.get("POST /api/ticket/approve")!(apReq);
+    const bAfter = (await loadTickets(store)).find((t) => t.id === b.id);
+    check("console: approval records the CF Access identity as approver", bAfter?.approval?.by === "alex@msp.com", bAfter?.approval?.by);
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
     await fsp.rm(cstore, { force: true }).catch(() => {});
     await fsp.rm(pstore, { force: true }).catch(() => {});
     await fsp.rm(gstore, { force: true }).catch(() => {});
+    await fsp.rm(rfile, { force: true }).catch(() => {});
   }
 }
 

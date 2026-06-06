@@ -26,6 +26,10 @@ export interface ConsoleCtx {
   projectStore: string;
   /** Graduation promotions store (JSONL). */
   graduationStore: string;
+  /** email→role map file (JSON), used with CF Access identity. */
+  rolesFile: string;
+  /** Trust Cf-Access-Authenticated-User-Email — true ONLY behind CF Access (else spoofable). */
+  trustAccessHeader: boolean;
   /** arnie hand-off queue root (tasks live in <queue>/inbox, outcomes alongside). */
   arnieQueue?: string;
   /** dario / LLM base URL, probed for the health panel. */
@@ -36,6 +40,27 @@ export interface ConsoleCtx {
 
 function json(status: number, body: unknown): ServerResponse {
   return { status, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
+}
+
+/**
+ * The authenticated staff email, from Cloudflare Access — but ONLY when
+ * trustAccessHeader is set (i.e., casey is actually behind CF Access). On
+ * loopback/dev the flag is off and this returns null, so the header can't be
+ * spoofed by a direct caller.
+ */
+function actingEmail(ctx: ConsoleCtx, req: ServerRequest): string | null {
+  if (!ctx.trustAccessHeader) return null;
+  const e = req.headers["cf-access-authenticated-user-email"];
+  return e ? String(e).toLowerCase() : null;
+}
+
+async function loadRoleMap(ctx: ConsoleCtx): Promise<Record<string, string>> {
+  try {
+    const m = JSON.parse(await fsp.readFile(ctx.rolesFile, "utf8")) as Record<string, string>;
+    return m && typeof m === "object" ? m : {};
+  } catch {
+    return {};
+  }
 }
 
 function parseBody(req: ServerRequest): Record<string, unknown> {
@@ -246,7 +271,7 @@ async function decide(ctx: ConsoleCtx, req: ServerRequest, decision: "approved" 
   if (!id) return json(400, { error: "missing id" });
   const t = await findTicket(ctx, id);
   if (!t) return json(404, { error: "not found" });
-  const by = body.by != null ? String(body.by) : "console";
+  const by = actingEmail(ctx, req) ?? (body.by != null ? String(body.by) : "console");
   const note = body.note != null ? String(body.note) : undefined;
   const at = new Date().toISOString();
   t.approval = { decision, by, at, note };
@@ -315,7 +340,7 @@ async function logTime(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespo
   const t = await findTicket(ctx, id);
   if (!t) return json(404, { error: "not found" });
   const at = new Date().toISOString();
-  const entry = { id: "te_" + Date.now().toString(36) + "_" + Math.floor(Math.random() * 1e6).toString(36), minutes, by: body.by != null ? String(body.by) : undefined, note: body.note != null ? String(body.note) : undefined, at };
+  const entry = { id: "te_" + Date.now().toString(36) + "_" + Math.floor(Math.random() * 1e6).toString(36), minutes, by: actingEmail(ctx, req) ?? (body.by != null ? String(body.by) : undefined), note: body.note != null ? String(body.note) : undefined, at };
   t.timeEntries = t.timeEntries || [];
   t.timeEntries.push(entry);
   t.updated_at = at;
@@ -547,6 +572,12 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   });
 
   server.route("GET", "/api/health", async () => json(200, await health(ctx)));
+  server.route("GET", "/api/me", async (req) => {
+    const email = actingEmail(ctx, req);
+    if (!email) return json(200, { email: null, role: null, trusted: ctx.trustAccessHeader });
+    const role = (await loadRoleMap(ctx))[email] ?? null;
+    return json(200, { email, role, trusted: true });
+  });
   server.route("GET", "/api/activity", async () => json(200, { events: await activity(ctx) }));
 
   server.route("POST", "/api/ticket/close", (req) => mutateStatus(ctx, req, "closed"));
@@ -750,7 +781,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null, graduations: null, selectedPattern: null };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null, graduations: null, selectedPattern: null, authed: false, authedEmail: null };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -1659,21 +1690,40 @@ export const CONSOLE_HTML = `<!doctype html>
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("uform").requestSubmit(); }
   });
 
-  // ---- roles: populate switcher ----
-  (function(){
-    state.role = localStorage.getItem("casey_role") || "owner";
+  // ---- roles: populate switcher (CF Access identity locks it when present) ----
+  function populateRoleSwitcher() {
     var sel = document.getElementById("role");
+    sel.innerHTML = "";
     ROLES.forEach(function(r){ var o = document.createElement("option"); o.value = r.id; o.textContent = r.label + (r.live ? "" : " · planned"); sel.appendChild(o); });
     sel.value = state.role;
-    sel.onchange = function(e){ state.role = e.target.value; applyRole(); };
-  })();
+    var rw = document.querySelector(".rolewrap");
+    if (state.authed) {
+      // Identity came from Cloudflare Access — pin the role, no manual switching.
+      sel.disabled = true;
+      if (rw && rw.firstChild) rw.firstChild.textContent = (state.authedEmail || "signed in") + " · ";
+      sel.onchange = null;
+    } else {
+      sel.disabled = false;
+      if (rw && rw.firstChild) rw.firstChild.textContent = "role ";
+      sel.onchange = function(e){ state.role = e.target.value; applyRole(); };
+    }
+  }
+  async function boot() {
+    try {
+      var me = await (await fetch("/api/me")).json();
+      if (me && me.email) state.authedEmail = me.email;
+      if (me && me.role) { state.role = me.role; state.authed = true; }
+    } catch (e) { /* not behind Access — fall through to manual switcher */ }
+    if (!state.authed) state.role = localStorage.getItem("casey_role") || "owner";
+    populateRoleSwitcher();
+    setView("admin");
+    applyRole();
+    loadClientsList().then(function(){ renderList(); });
+    loadTickets(false);
+    loadHealth();
+  }
+  boot();
 
-  // ---- boot + auto-refresh ----
-  setView("admin");
-  applyRole();
-  loadClientsList().then(function(){ renderList(); });
-  loadTickets(false);
-  loadHealth();
   setInterval(function(){
     if (state.view !== "admin") return;
     var r = activeRole();
