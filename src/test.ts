@@ -355,7 +355,7 @@ async function consoleTests(): Promise<void> {
         server.routes.has("POST /api/ticket/reply") && server.routes.has("POST /api/ticket/approve") &&
         server.routes.has("POST /api/ticket/reject") && server.routes.has("GET /api/clients") &&
         server.routes.has("POST /api/clients") && server.routes.has("POST /api/client/asset") &&
-        server.routes.has("POST /api/ticket/client"),
+        server.routes.has("POST /api/ticket/client") && server.routes.has("POST /api/ticket/assign"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -443,6 +443,14 @@ async function consoleTests(): Promise<void> {
     const sc = await server.routes.get("POST /api/ticket/client")!(post("/api/ticket/client", { id: a.id, clientId, assetId }));
     const afterSc = (await loadTickets(store)).find((t) => t.id === a.id);
     check("console: set client+asset on a ticket", sc.status === 200 && afterSc?.clientId === clientId && afterSc?.assetId === assetId, JSON.stringify({ c: afterSc?.clientId, a: afterSc?.assetId }));
+
+    const asg = await server.routes.get("POST /api/ticket/assign")!(post("/api/ticket/assign", { id: a.id, assignee: "alex" }));
+    const afterAsg = (await loadTickets(store)).find((t) => t.id === a.id);
+    check("console: assign sets the owner", asg.status === 200 && afterAsg?.assignee === "alex", afterAsg?.assignee);
+
+    const listSla = JSON.parse((await server.routes.get("GET /api/tickets")!(get("/api/tickets"))).body) as { tickets: Array<{ id: string; sla?: { state: string } }> };
+    const slaB = listSla.tickets.find((t) => t.id === b.id);
+    check("console: tickets carry computed SLA state", !!slaB?.sla && typeof slaB.sla.state === "string", JSON.stringify({ sla: slaB?.sla?.state }));
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});

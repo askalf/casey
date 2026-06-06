@@ -37,6 +37,8 @@ export interface Ticket {
   /** MSP client + asset this ticket belongs to (set by CSR/Dispatch). */
   clientId?: string;
   assetId?: string;
+  /** Staff member this ticket is assigned to (free-text until identity lands). */
+  assignee?: string;
 }
 
 /** A bare inbound ticket — the minimum to triage. */

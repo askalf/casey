@@ -54,6 +54,34 @@ async function readJson<T>(p: string): Promise<T | null> {
   }
 }
 
+// Priority → SLA targets (wall-clock ms): [response, resolution]. Business-hours
+// nuance is deferred; these are sane managed-services defaults.
+const SLA_TARGETS: Record<string, { resp: number; res: number }> = {
+  P1: { resp: 15 * 60000, res: 4 * 3600000 },
+  P2: { resp: 60 * 60000, res: 8 * 3600000 },
+  P3: { resp: 4 * 3600000, res: 24 * 3600000 },
+  P4: { resp: 8 * 3600000, res: 48 * 3600000 },
+};
+
+/** SLA posture for a ticket, computed from created/priority/first-response/status. */
+function computeSla(t: Ticket): { state: string; dueMs: number | null } {
+  const tgt = SLA_TARGETS[t.triage?.priority ?? "P3"] ?? SLA_TARGETS.P3;
+  const created = Date.parse(t.created_at) || Date.now();
+  const open = t.status !== "resolved" && t.status !== "closed";
+  if (!open) {
+    const resolvedAt = Date.parse(t.updated_at) || Date.now();
+    return { state: resolvedAt - created <= tgt.res ? "met" : "missed", dueMs: null };
+  }
+  const dueMs = tgt.res - (Date.now() - created);
+  let state = "ok";
+  if (dueMs < 0) state = "breached";
+  else if (dueMs < tgt.res * 0.25) state = "at_risk";
+  // Unanswered past the response target is at least at-risk.
+  const firstCasey = (t.thread ?? []).find((x) => x.role === "casey");
+  if (!firstCasey && Date.now() - created > tgt.resp && state === "ok") state = "at_risk";
+  return { state, dueMs };
+}
+
 /** Compact ticket shape for the list (no full thread). */
 function summarize(t: Ticket): Record<string, unknown> {
   return {
@@ -72,6 +100,8 @@ function summarize(t: Ticket): Record<string, unknown> {
     approval: t.approval ?? null,
     clientId: t.clientId ?? null,
     assetId: t.assetId ?? null,
+    assignee: t.assignee ?? null,
+    sla: computeSla(t),
   };
 }
 
@@ -247,6 +277,20 @@ async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespons
   return json(200, { ok: true, delivered, note, ticket: summarize(t) });
 }
 
+/** Assign (or clear) the staff member owning a ticket. */
+async function assignTicket(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  if (!id) return json(400, { error: "missing id" });
+  const t = await findTicket(ctx, id);
+  if (!t) return json(404, { error: "not found" });
+  const who = String(body.assignee ?? "").trim();
+  t.assignee = who || undefined;
+  t.updated_at = new Date().toISOString();
+  await saveTicket(ctx.ticketStore, t);
+  return json(200, { ok: true, assignee: t.assignee ?? null });
+}
+
 /** Attach (or clear) a client + asset on a ticket. */
 async function setTicketClient(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
   const body = parseBody(req);
@@ -361,7 +405,7 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
     if (!id) return json(400, { error: "missing id" });
     const t = await findTicket(ctx, id);
     if (!t) return json(404, { error: "not found" });
-    return json(200, { ticket: t, arnie: await arnieState(ctx, id) });
+    return json(200, { ticket: { ...t, sla: computeSla(t) }, arnie: await arnieState(ctx, id) });
   });
 
   server.route("GET", "/api/health", async () => json(200, await health(ctx)));
@@ -377,6 +421,7 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/clients", (req) => createClient(ctx, req));
   server.route("POST", "/api/client/asset", (req) => addClientAsset(ctx, req));
   server.route("POST", "/api/ticket/client", (req) => setTicketClient(ctx, req));
+  server.route("POST", "/api/ticket/assign", (req) => assignTicket(ctx, req));
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +530,10 @@ export const CONSOLE_HTML = `<!doctype html>
   .planned .pl { font-size:11px; letter-spacing:.08em; color:var(--amber); margin-bottom:8px; }
   .planned h2 { margin:0 0 8px; }
   .planned .plb { color:var(--dim); }
+  .sla-breached, .sla-missed { color:var(--red); border-color:#3f1f1f; }
+  .sla-at_risk { color:var(--amber); border-color:#3f3315; }
+  .sla-met { color:var(--green); border-color:#1f3b29; }
+  .sla-ok { color:var(--dim); }
   /* User view: chat */
   #user { height:100%; display:flex; align-items:center; justify-content:center; }
   .chat { width:min(560px,94vw); height:min(720px,94%); background:var(--panel); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--line); }
@@ -589,12 +638,12 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- admin: list + health ----
   // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
   var ROLES = [
-    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client"],
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client","assign"],
       blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
     { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client"],
       blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct. Set the client + asset." },
-    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"priority", actions:["redispatch","close","reply","client"],
-      blurb:"All open work, highest priority first. (SLA timers + assignment land in Phase 2.)" },
+    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"sla", actions:["assign","redispatch","close","reply","client"],
+      blurb:"All open work, most SLA-urgent first. Assign owners; watch breaches." },
     { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply"],
       blurb:"Arnie escalations awaiting sign-off. Approve authorizes the proposed remediation (arnie executes once execute-on-approval ships); reject sends it back." },
     { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["approve","reject","redispatch","close","reply"],
@@ -666,6 +715,14 @@ export const CONSOLE_HTML = `<!doctype html>
       if (activeRole().sort === "priority") {
         var ord = { P1:0, P2:1, P3:2, P4:3 };
         shown.sort(function(a,b){ return (ord[a.priority]==null?9:ord[a.priority]) - (ord[b.priority]==null?9:ord[b.priority]); });
+      } else if (activeRole().sort === "sla") {
+        var rank = { breached:0, at_risk:1, ok:2, missed:3, met:4 };
+        shown.sort(function(a,b){
+          var ra = rank[(a.sla && a.sla.state) || "ok"]; var rb = rank[(b.sla && b.sla.state) || "ok"];
+          if (ra !== rb) return ra - rb;
+          var da = (a.sla && a.sla.dueMs != null) ? a.sla.dueMs : 1e15; var db = (b.sla && b.sla.dueMs != null) ? b.sla.dueMs : 1e15;
+          return da - db;
+        });
       }
       if (!shown.length) { list.appendChild(el("div", "row", "No tickets match.")); return; }
       shown.forEach(function(t) {
@@ -678,6 +735,8 @@ export const CONSOLE_HTML = `<!doctype html>
         if (t.status === "escalated" && !t.approval) sub.appendChild(el("span", "chip", "⏳ approve"));
         var cn = t.clientId ? clientName(t.clientId) : null;
         if (cn) sub.appendChild(el("span", "chip", cn));
+        if (t.sla && t.sla.state && t.sla.state !== "ok" && t.sla.state !== "met") sub.appendChild(el("span", "chip sla-" + t.sla.state, slaLabel(t.sla) || t.sla.state));
+        if (t.assignee) sub.appendChild(el("span", null, "· @" + t.assignee));
         sub.appendChild(el("span", null, "· " + (t.from || "")));
         row.appendChild(sub);
         row.appendChild(el("div", "sub", ago(t.updated_at) + " · " + (t.channel || "")));
@@ -734,6 +793,7 @@ export const CONSOLE_HTML = `<!doctype html>
     open.forEach(function(t){ if (t.tier) byTier[t.tier] = (byTier[t.tier]||0)+1; });
     var pending = state.health && state.health.arnie ? (state.health.arnie.pending||0) : 0;
     var needsAppr = ts.filter(function(t){ return t.status === "escalated" && !t.approval; }).length;
+    var slaBreached = ts.filter(function(t){ return t.sla && t.sla.state === "breached"; }).length;
     k.innerHTML = "";
     function card(n, label, cls) {
       var c = el("div", "k");
@@ -745,6 +805,7 @@ export const CONSOLE_HTML = `<!doctype html>
     k.appendChild(card(p1.length, "P1 open", p1.length ? "bad" : ""));
     k.appendChild(card(today.length, "today"));
     k.appendChild(card(needsAppr, "needs approval", needsAppr ? "warn" : ""));
+    k.appendChild(card(slaBreached, "SLA breached", slaBreached ? "bad" : ""));
     k.appendChild(card(pending, "escalating→arnie", pending ? "warn" : ""));
     var tc = el("div", "k");
     var bars = el("div", "bars");
@@ -782,6 +843,15 @@ export const CONSOLE_HTML = `<!doctype html>
   async function setClient(ticketId, clientId, assetId) {
     await fetch("/api/ticket/client", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: ticketId, clientId: clientId || "", assetId: assetId || "" }) });
     await loadTickets(true); selectTicket(ticketId, true);
+  }
+  function slaLabel(s) {
+    if (!s) return null;
+    if (s.state === "met") return "SLA met";
+    if (s.state === "missed") return "SLA missed";
+    if (s.dueMs == null) return null;
+    var m = Math.abs(s.dueMs);
+    var txt = m < 3600000 ? (Math.round(m/60000) + "m") : (m < 86400000 ? (Math.round(m/3600000) + "h") : (Math.round(m/86400000) + "d"));
+    return s.state === "breached" ? ("SLA overdue " + txt) : ("SLA " + txt + " left");
   }
 
   // ---- admin: detail ----
@@ -828,6 +898,7 @@ export const CONSOLE_HTML = `<!doctype html>
     dh.appendChild(el("span", "chip st-" + t.status, t.status));
     d.appendChild(dh);
     d.appendChild(el("div", "meta", t.id + " · " + (t.channel || "") + " · from " + (t.from || "") + " · created " + ago(t.created_at) + " · updated " + ago(t.updated_at)));
+    d.appendChild(el("div", "meta", "SLA: " + (slaLabel(t.sla) || (t.sla ? t.sla.state : "—")) + (t.assignee ? ("   ·   assigned: " + t.assignee) : "")));
 
     // Client / Asset
     var cName = t.clientId ? (clientName(t.clientId) || t.clientId) : null;
@@ -882,9 +953,20 @@ export const CONSOLE_HTML = `<!doctype html>
     var canClose = roleAllows(t.status === "closed" ? "reopen" : "close");
     var canRedo = roleAllows("redispatch");
     var canReply = roleAllows("reply");
-    if (canClose || canRedo) {
+    var canAssign = roleAllows("assign");
+    if (canClose || canRedo || canAssign) {
       d.appendChild(el("div", "sec", "Actions"));
       var actions = el("div", "actions");
+      if (canAssign) {
+        var asgn = el("button", "btn", t.assignee ? ("Reassign (" + t.assignee + ")") : "Assign");
+        asgn.onclick = async function(){
+          var who = prompt("Assign to (name):", t.assignee || "");
+          if (who === null) return;
+          await fetch("/api/ticket/assign", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: t.id, assignee: who }) });
+          toast("assigned"); await loadTickets(true); selectTicket(t.id, true);
+        };
+        actions.appendChild(asgn);
+      }
       if (canClose) {
         var closeBtn = el("button", "btn warn", t.status === "closed" ? "Reopen" : "Close");
         closeBtn.onclick = function(){ doAction(t.status === "closed" ? "reopen" : "close", { id: t.id }, t.id); };
