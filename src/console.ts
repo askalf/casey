@@ -4,7 +4,11 @@ import path from "node:path";
 import { loadTickets, saveTicket, addTurn, type Ticket } from "./ticket.js";
 import { loadClients, saveClient, newClient, newAsset, type Client } from "./clients.js";
 import { loadProjects, saveProject, newProject, newTask, type Project, type ProjectStatus, type TaskStatus } from "./projects.js";
+import { loadPromotions, savePromotion } from "./graduations.js";
 import type { ChannelServer, ServerRequest, ServerResponse } from "./channels/types.js";
+
+/** Approvals of the same remediation pattern past this count graduate to auto-eligible. */
+const GRAD_THRESHOLD = 3;
 
 /**
  * The operator console — a single-pane web UI (sidebar + detail) served at
@@ -20,6 +24,8 @@ export interface ConsoleCtx {
   clientStore: string;
   /** Project work-item store (JSONL). */
   projectStore: string;
+  /** Graduation promotions store (JSONL). */
+  graduationStore: string;
   /** arnie hand-off queue root (tasks live in <queue>/inbox, outcomes alongside). */
   arnieQueue?: string;
   /** dario / LLM base URL, probed for the health panel. */
@@ -426,6 +432,42 @@ async function projectTask(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerR
   return json(200, { ok: true, project: p });
 }
 
+// ---- Graduation (T2 phase-out): approvals per pattern → auto-eligibility ----
+async function computeGraduations(ctx: ConsoleCtx): Promise<Record<string, unknown>> {
+  const tickets = await loadTickets(ctx.ticketStore);
+  const promos = await loadPromotions(ctx.graduationStore);
+  const promoMap = new Map(promos.map((p) => [p.key, p]));
+  const byKey = new Map<string, { key: string; approvals: number; rejections: number; tickets: { id: string; subject: string }[] }>();
+  for (const t of tickets) {
+    if (!t.approval) continue;
+    const key = t.triage?.category ?? "other";
+    let e = byKey.get(key);
+    if (!e) {
+      e = { key, approvals: 0, rejections: 0, tickets: [] };
+      byKey.set(key, e);
+    }
+    if (t.approval.decision === "approved") {
+      e.approvals++;
+      e.tickets.push({ id: t.id, subject: t.subject });
+    } else {
+      e.rejections++;
+    }
+  }
+  const patterns = [...byKey.values()]
+    .map((e) => ({ ...e, graduated: e.approvals >= GRAD_THRESHOLD, promoted: !!promoMap.get(e.key)?.auto }))
+    .sort((a, b) => b.approvals - a.approvals);
+  return { threshold: GRAD_THRESHOLD, patterns };
+}
+
+async function promoteGraduation(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const key = String(body.key ?? "");
+  if (!key) return json(400, { error: "missing key" });
+  const rec = { key, auto: !!body.auto, by: body.by != null ? String(body.by) : "console", at: new Date().toISOString() };
+  await savePromotion(ctx.graduationStore, rec);
+  return json(200, { ok: true, promotion: rec });
+}
+
 interface ActivityEvent {
   at: string;
   actor: string;
@@ -531,6 +573,8 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/projects", (req) => createProject(ctx, req));
   server.route("POST", "/api/project/update", (req) => updateProject(ctx, req));
   server.route("POST", "/api/project/task", (req) => projectTask(ctx, req));
+  server.route("GET", "/api/graduations", async () => json(200, await computeGraduations(ctx)));
+  server.route("POST", "/api/graduation/promote", (req) => promoteGraduation(ctx, req));
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +750,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null, graduations: null, selectedPattern: null };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -771,7 +815,7 @@ export const CONSOLE_HTML = `<!doctype html>
     { id:"sales", label:"Sales", live:false, phase:5, blurb:"Pipeline + leads; casey splits intake-vs-lead at the front door." },
     { id:"am", label:"Account Manager", live:true, board:"clients", blurb:"Client book — per-client health, open work, SLA breaches, hours. Relationship + reporting view." },
     { id:"accounting", label:"Accounting / HR", live:false, phase:5, blurb:"Billable time to invoice; contract usage. Needs time tracking." },
-    { id:"dev", label:"Dev", live:false, phase:6, blurb:"Custom work + authoring arnie remediation playbooks." }
+    { id:"dev", label:"Dev / Automation", live:true, board:"graduation", blurb:"Which approved remediation patterns have graduated to auto. Promote a proven pattern so arnie runs it without sign-off (arnie consults this once execute-on-approval ships)." }
   ];
   function activeRole() { for (var i=0;i<ROLES.length;i++){ if (ROLES[i].id===state.role) return ROLES[i]; } return ROLES[0]; }
   function roleScope(t) {
@@ -806,6 +850,7 @@ export const CONSOLE_HTML = `<!doctype html>
     }
     if (r.board === "project") { showProjectBoard(); return; }
     if (r.board === "clients") { showClientBoard(); return; }
+    if (r.board === "graduation") { showGradBoard(); return; }
     state.filter = r.filter || "all";
     var fsel = document.getElementById("filter"); if (fsel) fsel.value = state.filter;
     renderList();
@@ -1180,6 +1225,74 @@ export const CONSOLE_HTML = `<!doctype html>
     k.appendChild(card(totalOpen, "open tickets"));
     k.appendChild(card(totalBreach, "SLA breached", totalBreach ? "bad" : ""));
     k.appendChild(card(fmtMins(totalMin), "billable logged", "good"));
+  }
+
+  // ---- Dev / Automation: graduation board (T2 phase-out) ----
+  async function loadGraduations() {
+    try { var r = await fetch("/api/graduations"); state.graduations = await r.json(); } catch (e) { /* transient */ }
+  }
+  function gradPatterns() { return (state.graduations && state.graduations.patterns) || []; }
+  function gradThreshold() { return (state.graduations && state.graduations.threshold) || 3; }
+  function showGradBoard() {
+    renderGradList(); renderGradKpi();
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    d.appendChild(el("div", "rolenote", activeRole().blurb || ""));
+    d.appendChild(el("div", "empty", "Select a pattern to see its approval history and promote it to auto."));
+    loadGraduations().then(function(){ renderGradList(); renderGradKpi(); });
+  }
+  function renderGradList() {
+    var list = document.getElementById("list");
+    preserveScroll(list, function(){
+      list.innerHTML = "";
+      var pats = gradPatterns();
+      if (!pats.length) { list.appendChild(el("div", "row", "No approval history yet — sign off on some escalations first.")); return; }
+      pats.forEach(function(p){
+        var row = el("div", "row" + (p.key === state.selectedPattern ? " sel" : ""));
+        row.appendChild(el("div", "subj", p.key));
+        var sub = el("div", "sub");
+        sub.appendChild(el("span", null, p.approvals + "/" + gradThreshold() + " approvals"));
+        if (p.promoted) sub.appendChild(el("span", "chip proj-active", "AUTO"));
+        else if (p.graduated) sub.appendChild(el("span", "chip sla-at_risk", "graduated"));
+        row.appendChild(sub);
+        row.onclick = function(){ selectPattern(p.key); };
+        list.appendChild(row);
+      });
+    });
+  }
+  function selectPattern(key) {
+    state.selectedPattern = key; renderGradList();
+    var p = gradPatterns().find(function(x){ return x.key === key; }); if (!p) return;
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    var dh = el("div", "dh"); dh.appendChild(el("h2", null, p.key));
+    if (p.promoted) dh.appendChild(el("span", "chip proj-active", "AUTO"));
+    else if (p.graduated) dh.appendChild(el("span", "chip sla-at_risk", "graduated"));
+    d.appendChild(dh);
+    d.appendChild(el("div", "meta", p.approvals + " approvals · " + p.rejections + " rejections · threshold " + gradThreshold()));
+    var c = el("div", "card");
+    c.appendChild(el("div", "meta", p.promoted ? "Arnie will run this pattern without sign-off once execute-on-approval ships." : (p.graduated ? "Approved enough times to graduate — promote it to let arnie auto-run it." : "Needs " + (gradThreshold() - p.approvals) + " more approval(s) to graduate.")));
+    var arow = el("div", "actions");
+    var pb = el("button", "btn" + (p.promoted ? " warn" : " primary"), p.promoted ? "Demote (require sign-off)" : "Promote to auto");
+    pb.disabled = !p.graduated && !p.promoted;
+    pb.onclick = async function(){ await fetch("/api/graduation/promote", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ key: p.key, auto: !p.promoted }) }); toast(p.promoted ? "demoted" : "promoted to auto"); await loadGraduations(); renderGradList(); renderGradKpi(); selectPattern(p.key); };
+    arow.appendChild(pb); c.appendChild(arow);
+    d.appendChild(c);
+    d.appendChild(el("div", "sec", "Approved tickets (" + (p.tickets || []).length + ")"));
+    var tl = el("div", "feed");
+    (p.tickets || []).forEach(function(t){ var row = el("div", "ev"); var x = el("span", "ex"); x.appendChild(el("b", null, t.subject || "(no subject)")); x.appendChild(el("span", "es", " · " + t.id)); row.appendChild(x); tl.appendChild(row); });
+    d.appendChild(tl);
+  }
+  function renderGradKpi() {
+    var k = document.getElementById("kpi"); if (!k) return;
+    var pats = gradPatterns();
+    var grad = pats.filter(function(p){ return p.graduated; }).length;
+    var promo = pats.filter(function(p){ return p.promoted; }).length;
+    var appr = pats.reduce(function(s,p){ return s + p.approvals; }, 0);
+    k.innerHTML = "";
+    function card(n, label, cls) { var c = el("div", "k"); c.appendChild(el("div", "n" + (cls ? " " + cls : ""), String(n))); c.appendChild(el("div", "l", label)); return c; }
+    k.appendChild(card(pats.length, "patterns"));
+    k.appendChild(card(grad, "graduated", grad ? "warn" : ""));
+    k.appendChild(card(promo, "auto-promoted", promo ? "good" : ""));
+    k.appendChild(card(appr, "total approvals"));
   }
 
   // ---- admin: detail ----
@@ -1567,6 +1680,7 @@ export const CONSOLE_HTML = `<!doctype html>
     if (!r.live) return;
     if (r.board === "project") { loadProjectsList().then(function(){ renderProjectList(); renderProjectKpi(); }); return; }
     if (r.board === "clients") { Promise.all([loadTickets(true), loadClientsList()]).then(function(){ renderClientList(); renderClientKpi(); }); return; }
+    if (r.board === "graduation") { loadGraduations().then(function(){ renderGradList(); renderGradKpi(); }); return; }
     loadTickets(true);
     loadHealth();
     if (state.selected) selectTicket(state.selected);   // change-detected + scroll-preserving

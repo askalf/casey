@@ -220,6 +220,7 @@ async function cmdServe(config: Config): Promise<void> {
       ticketStore: config.ticketStore,
       clientStore: path.join(path.dirname(config.ticketStore), "clients.jsonl"),
       projectStore: path.join(path.dirname(config.ticketStore), "projects.jsonl"),
+      graduationStore: path.join(path.dirname(config.ticketStore), "graduations.jsonl"),
       arnieQueue: config.arnieQueue,
       darioUrl: config.dario ? config.baseUrl ?? "http://localhost:3456" : config.baseUrl,
       deliver: async (ticket, text) => {

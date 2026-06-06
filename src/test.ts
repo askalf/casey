@@ -333,6 +333,7 @@ async function consoleTests(): Promise<void> {
   const queue = path.join(os.tmpdir(), `casey-console-q-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`);
   const cstore = path.join(os.tmpdir(), `casey-console-c-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const pstore = path.join(os.tmpdir(), `casey-console-p-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
+  const gstore = path.join(os.tmpdir(), `casey-console-g-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const get = (p: string, query: Record<string, string> = {}): ServerRequest => ({ method: "GET", path: p, query, headers: {}, body: "" });
   const post = (p: string, body: unknown): ServerRequest => ({ method: "POST", path: p, query: {}, headers: {}, body: JSON.stringify(body) });
   try {
@@ -346,7 +347,7 @@ async function consoleTests(): Promise<void> {
     await saveTicket(store, b);
 
     const server = new MockServer();
-    registerConsole(server, { ticketStore: store, clientStore: cstore, projectStore: pstore, arnieQueue: queue, darioUrl: undefined });
+    registerConsole(server, { ticketStore: store, clientStore: cstore, projectStore: pstore, graduationStore: gstore, arnieQueue: queue, darioUrl: undefined });
 
     check(
       "console: registers page + api routes",
@@ -493,11 +494,25 @@ async function consoleTests(): Promise<void> {
     check("console: procurement advances + keeps item", pr2.status === 200 && afterPr?.procurement?.status === "received" && afterPr?.procurement?.item === "Dell laptop", JSON.stringify(afterPr?.procurement));
     const prBad = await server.routes.get("POST /api/ticket/procurement")!(post("/api/ticket/procurement", { id: a.id, status: "nope" }));
     check("console: procurement rejects bad status → 400", prBad.status === 400);
+
+    check(
+      "console: registers graduation routes",
+      server.routes.has("GET /api/graduations") && server.routes.has("POST /api/graduation/promote"),
+    );
+    await server.routes.get("POST /api/ticket/approve")!(post("/api/ticket/approve", { id: b.id }));
+    const gradRes = await server.routes.get("GET /api/graduations")!(get("/api/graduations"));
+    const gradBody = JSON.parse(gradRes.body) as { threshold: number; patterns: Array<{ key: string; approvals: number; graduated: boolean; promoted: boolean }> };
+    const net = gradBody.patterns.find((p) => p.key === "network");
+    check("console: graduations count approvals per pattern", gradRes.status === 200 && gradBody.threshold === 3 && !!net && net.approvals >= 1, JSON.stringify({ approvals: net?.approvals }));
+    const promoRes = await server.routes.get("POST /api/graduation/promote")!(post("/api/graduation/promote", { key: "network", auto: true }));
+    const grad2 = JSON.parse((await server.routes.get("GET /api/graduations")!(get("/api/graduations"))).body) as { patterns: Array<{ key: string; promoted: boolean }> };
+    check("console: promote marks a pattern auto", promoRes.status === 200 && !!grad2.patterns.find((p) => p.key === "network" && p.promoted));
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
     await fsp.rm(cstore, { force: true }).catch(() => {});
     await fsp.rm(pstore, { force: true }).catch(() => {});
+    await fsp.rm(gstore, { force: true }).catch(() => {});
   }
 }
 
