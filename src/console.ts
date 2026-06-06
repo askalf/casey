@@ -688,7 +688,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -748,7 +748,7 @@ export const CONSOLE_HTML = `<!doctype html>
     { id:"procurement", label:"Procurement", live:false, phase:3, blurb:"Purchase orders + vendor management; hands off to Bench." },
     { id:"project", label:"Project", live:true, board:"project", blurb:"Project board — onboardings, migrations, rollouts. Human-run: tasks, status, assignment (no AI execution yet)." },
     { id:"sales", label:"Sales", live:false, phase:5, blurb:"Pipeline + leads; casey splits intake-vs-lead at the front door." },
-    { id:"am", label:"Account Manager", live:false, phase:5, blurb:"Client book, health, QBR reporting. Needs the client model." },
+    { id:"am", label:"Account Manager", live:true, board:"clients", blurb:"Client book — per-client health, open work, SLA breaches, hours. Relationship + reporting view." },
     { id:"accounting", label:"Accounting / HR", live:false, phase:5, blurb:"Billable time to invoice; contract usage. Needs time tracking." },
     { id:"dev", label:"Dev", live:false, phase:6, blurb:"Custom work + authoring arnie remediation playbooks." }
   ];
@@ -782,6 +782,7 @@ export const CONSOLE_HTML = `<!doctype html>
       return;
     }
     if (r.board === "project") { showProjectBoard(); return; }
+    if (r.board === "clients") { showClientBoard(); return; }
     state.filter = r.filter || "all";
     var fsel = document.getElementById("filter"); if (fsel) fsel.value = state.filter;
     renderList();
@@ -803,7 +804,7 @@ export const CONSOLE_HTML = `<!doctype html>
     return t.status === f;
   }
   function renderList() {
-    if (activeRole().board === "project") return; // project board renders its own list
+    if (activeRole().board) return; // custom boards (project/clients) render their own list
     var list = document.getElementById("list");
     if (!activeRole().live) { list.innerHTML = ""; list.appendChild(el("div", "row", "— view not wired yet —")); return; }
     preserveScroll(list, function() {
@@ -876,7 +877,7 @@ export const CONSOLE_HTML = `<!doctype html>
   }
 
   function renderKpi() {
-    if (activeRole().board === "project") return; // project board renders its own KPIs
+    if (activeRole().board) return; // custom boards render their own KPIs
     var k = document.getElementById("kpi");
     if (!k) return;
     var ts = state.tickets;
@@ -1062,6 +1063,99 @@ export const CONSOLE_HTML = `<!doctype html>
     k.appendChild(card(planning, "planning"));
     k.appendChild(card(doing, "tasks doing", doing ? "warn" : ""));
     k.appendChild(card(doneTasks + " / " + allTasks, "tasks done", "good"));
+  }
+
+  // ---- Account Manager: client book (read-only rollup over tickets + clients) ----
+  function clientStats(clientId) {
+    var openS = ["new","awaiting_client","troubleshooting","escalated"];
+    var tix = state.tickets.filter(function(t){ return t.clientId === clientId; });
+    var open = tix.filter(function(t){ return openS.indexOf(t.status) >= 0; }).length;
+    var breaches = tix.filter(function(t){ return t.sla && t.sla.state === "breached"; }).length;
+    var mins = tix.reduce(function(s,t){ return s + (t.minutes || 0); }, 0);
+    var last = tix.reduce(function(m,t){ return (t.updated_at || "") > m ? t.updated_at : m; }, "");
+    return { total: tix.length, open: open, breaches: breaches, minutes: mins, last: last, tickets: tix };
+  }
+  function showClientBoard() {
+    renderClientList();
+    renderClientKpi();
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    d.appendChild(el("div", "rolenote", activeRole().blurb || ""));
+    d.appendChild(el("div", "empty", "Select a client to see their health, open work, and hours."));
+    Promise.all([loadClientsList(), loadTickets(false)]).then(function(){ renderClientList(); renderClientKpi(); });
+  }
+  function renderClientList() {
+    var list = document.getElementById("list");
+    preserveScroll(list, function(){
+      list.innerHTML = "";
+      var head = el("div", "row");
+      var nb = el("button", "btn primary", "+ New client");
+      nb.onclick = createClientPrompt;
+      head.appendChild(nb);
+      list.appendChild(head);
+      if (!state.clients.length) { list.appendChild(el("div", "row", "No clients yet.")); return; }
+      var sorted = state.clients.slice().sort(function(a,b){ return clientStats(b.id).open - clientStats(a.id).open; });
+      sorted.forEach(function(c){
+        var st = clientStats(c.id);
+        var row = el("div", "row" + (c.id === state.selectedClient ? " sel" : ""));
+        row.appendChild(el("div", "subj", c.name));
+        var sub = el("div", "sub");
+        sub.appendChild(el("span", "chip", st.open + " open"));
+        if (st.breaches) sub.appendChild(el("span", "chip sla-breached", st.breaches + " breach"));
+        if (st.minutes) sub.appendChild(el("span", null, fmtMins(st.minutes)));
+        row.appendChild(sub);
+        row.onclick = function(){ selectClient(c.id); };
+        list.appendChild(row);
+      });
+    });
+  }
+  async function createClientPrompt() {
+    var nm = prompt("New client name:"); if (!nm) return;
+    var dom = prompt("Email domain (optional, e.g. acme.com):") || "";
+    var r = await fetch("/api/clients", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ name: nm, domain: dom }) });
+    var d = await r.json(); await loadClientsList(); renderClientList(); renderClientKpi(); if (d.client) selectClient(d.client.id);
+  }
+  function selectClient(id) {
+    state.selectedClient = id; renderClientList();
+    var c = clientById(id); if (!c) return;
+    var st = clientStats(id);
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    var dh = el("div", "dh"); dh.appendChild(el("h2", null, c.name)); d.appendChild(dh);
+    d.appendChild(el("div", "meta", (c.domain ? (c.domain + " · ") : "") + (c.assets || []).length + " assets · last activity " + (st.last ? ago(st.last) : "—")));
+    d.appendChild(el("div", "sec", "Health"));
+    var hc = el("div", "card"); var kv = el("div", "kv");
+    function pair(k, v) { kv.appendChild(el("b", null, k)); kv.appendChild(el("span", null, String(v))); }
+    pair("open tickets", st.open); pair("total tickets", st.total); pair("SLA breaches", st.breaches); pair("billable", fmtMins(st.minutes));
+    hc.appendChild(kv); d.appendChild(hc);
+    if ((c.assets || []).length) {
+      d.appendChild(el("div", "sec", "Assets (" + c.assets.length + ")"));
+      var ac = el("div", "card");
+      c.assets.forEach(function(a){ ac.appendChild(el("div", "meta", a.name + (a.type ? (" · " + a.type) : ""))); });
+      d.appendChild(ac);
+    }
+    d.appendChild(el("div", "sec", "Tickets (" + st.total + ")"));
+    var tl = el("div", "feed");
+    st.tickets.sort(function(a,b){ return (b.updated_at||"").localeCompare(a.updated_at||""); }).forEach(function(t){
+      var row = el("div", "ev");
+      row.appendChild(el("span", "et", ago(t.updated_at)));
+      var x = el("span", "ex"); x.appendChild(el("b", null, t.subject || "(no subject)"));
+      var meta = " · " + t.status + (t.priority ? (" · " + t.priority) : "") + (t.minutes ? (" · " + fmtMins(t.minutes)) : "");
+      x.appendChild(el("span", "es", meta));
+      row.appendChild(x);
+      tl.appendChild(row);
+    });
+    d.appendChild(tl);
+  }
+  function renderClientKpi() {
+    var k = document.getElementById("kpi"); if (!k) return;
+    var cs = state.clients;
+    var totalOpen = 0, totalBreach = 0, totalMin = 0;
+    cs.forEach(function(c){ var s = clientStats(c.id); totalOpen += s.open; totalBreach += s.breaches; totalMin += s.minutes; });
+    k.innerHTML = "";
+    function card(n, label, cls) { var c = el("div", "k"); c.appendChild(el("div", "n" + (cls ? " " + cls : ""), String(n))); c.appendChild(el("div", "l", label)); return c; }
+    k.appendChild(card(cs.length, "clients"));
+    k.appendChild(card(totalOpen, "open tickets"));
+    k.appendChild(card(totalBreach, "SLA breached", totalBreach ? "bad" : ""));
+    k.appendChild(card(fmtMins(totalMin), "billable logged", "good"));
   }
 
   // ---- admin: detail ----
@@ -1425,6 +1519,7 @@ export const CONSOLE_HTML = `<!doctype html>
     var r = activeRole();
     if (!r.live) return;
     if (r.board === "project") { loadProjectsList().then(function(){ renderProjectList(); renderProjectKpi(); }); return; }
+    if (r.board === "clients") { Promise.all([loadTickets(true), loadClientsList()]).then(function(){ renderClientList(); renderClientKpi(); }); return; }
     loadTickets(true);
     loadHealth();
     if (state.selected) selectTicket(state.selected);   // change-detected + scroll-preserving
