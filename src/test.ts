@@ -357,7 +357,7 @@ async function consoleTests(): Promise<void> {
         server.routes.has("POST /api/ticket/reject") && server.routes.has("GET /api/clients") &&
         server.routes.has("POST /api/clients") && server.routes.has("POST /api/client/asset") &&
         server.routes.has("POST /api/ticket/client") && server.routes.has("POST /api/ticket/assign") &&
-        server.routes.has("POST /api/ticket/time"),
+        server.routes.has("POST /api/ticket/time") && server.routes.has("POST /api/ticket/procurement"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -485,6 +485,14 @@ async function consoleTests(): Promise<void> {
     check("console: log time rejects non-positive minutes → 400", tmBad.status === 400);
     const listMin = JSON.parse((await server.routes.get("GET /api/tickets")!(get("/api/tickets"))).body) as { tickets: Array<{ id: string; minutes?: number }> };
     check("console: ticket summary carries total minutes", (listMin.tickets.find((t) => t.id === a.id)?.minutes) === 75);
+
+    const pr1 = await server.routes.get("POST /api/ticket/procurement")!(post("/api/ticket/procurement", { id: a.id, status: "requested", item: "Dell laptop" }));
+    check("console: procurement request sets status", pr1.status === 200 && (JSON.parse(pr1.body) as { procurement: { status: string; item: string } }).procurement.status === "requested");
+    const pr2 = await server.routes.get("POST /api/ticket/procurement")!(post("/api/ticket/procurement", { id: a.id, status: "received" }));
+    const afterPr = (await loadTickets(store)).find((t) => t.id === a.id);
+    check("console: procurement advances + keeps item", pr2.status === 200 && afterPr?.procurement?.status === "received" && afterPr?.procurement?.item === "Dell laptop", JSON.stringify(afterPr?.procurement));
+    const prBad = await server.routes.get("POST /api/ticket/procurement")!(post("/api/ticket/procurement", { id: a.id, status: "nope" }));
+    check("console: procurement rejects bad status → 400", prBad.status === 400);
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
