@@ -105,6 +105,8 @@ function summarize(t: Ticket): Record<string, unknown> {
     assetId: t.assetId ?? null,
     assignee: t.assignee ?? null,
     sla: computeSla(t),
+    minutes: (t.timeEntries ?? []).reduce((s, e) => s + (e.minutes || 0), 0),
+    minutesToday: (t.timeEntries ?? []).filter((e) => (e.at || "").slice(0, 10) === new Date().toISOString().slice(0, 10)).reduce((s, e) => s + (e.minutes || 0), 0),
   };
 }
 
@@ -278,6 +280,24 @@ async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespons
     }
   }
   return json(200, { ok: true, delivered, note, ticket: summarize(t) });
+}
+
+/** Log billable time against a ticket. */
+async function logTime(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  const minutes = Math.round(Number(body.minutes));
+  if (!id) return json(400, { error: "missing id" });
+  if (!Number.isFinite(minutes) || minutes <= 0) return json(400, { error: "minutes must be a positive number" });
+  const t = await findTicket(ctx, id);
+  if (!t) return json(404, { error: "not found" });
+  const at = new Date().toISOString();
+  const entry = { id: "te_" + Date.now().toString(36) + "_" + Math.floor(Math.random() * 1e6).toString(36), minutes, by: body.by != null ? String(body.by) : undefined, note: body.note != null ? String(body.note) : undefined, at };
+  t.timeEntries = t.timeEntries || [];
+  t.timeEntries.push(entry);
+  t.updated_at = at;
+  await saveTicket(ctx.ticketStore, t);
+  return json(200, { ok: true, entry, totalMinutes: t.timeEntries.reduce((s, e) => s + e.minutes, 0) });
 }
 
 /** Assign (or clear) the staff member owning a ticket. */
@@ -481,6 +501,7 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/client/asset", (req) => addClientAsset(ctx, req));
   server.route("POST", "/api/ticket/client", (req) => setTicketClient(ctx, req));
   server.route("POST", "/api/ticket/assign", (req) => assignTicket(ctx, req));
+  server.route("POST", "/api/ticket/time", (req) => logTime(ctx, req));
   server.route("GET", "/api/projects", async () => json(200, { projects: await loadProjects(ctx.projectStore) }));
   server.route("GET", "/api/project", async (req) => {
     const id = req.query.id;
@@ -712,15 +733,15 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- admin: list + health ----
   // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
   var ROLES = [
-    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client","assign"],
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client","assign","time"],
       blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
-    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client"],
+    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client","time"],
       blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct. Set the client + asset." },
-    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"sla", actions:["assign","redispatch","close","reply","client"],
+    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"sla", actions:["assign","redispatch","close","reply","client","time"],
       blurb:"All open work, most SLA-urgent first. Assign owners; watch breaches." },
-    { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply"],
+    { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply","time"],
       blurb:"Arnie escalations awaiting sign-off. Approve authorizes the proposed remediation (arnie executes once execute-on-approval ships); reject sends it back." },
-    { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["approve","reject","redispatch","close","reply"],
+    { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["approve","reject","redispatch","close","reply","time"],
       blurb:"Security-classed tickets + escalations to sign off on." },
     { id:"backup", label:"Backup", live:false, phase:3, blurb:"Backup-failure queue + restore approvals. Needs alert intake + the asset model." },
     { id:"bench", label:"Bench", live:false, phase:3, blurb:"Device-prep / imaging / RMA queue. Needs the asset model + procurement handoff." },
@@ -871,6 +892,7 @@ export const CONSOLE_HTML = `<!doctype html>
     var pending = state.health && state.health.arnie ? (state.health.arnie.pending||0) : 0;
     var needsAppr = ts.filter(function(t){ return t.status === "escalated" && !t.approval; }).length;
     var slaBreached = ts.filter(function(t){ return t.sla && t.sla.state === "breached"; }).length;
+    var minsToday = ts.reduce(function(s,t){ return s + (t.minutesToday || 0); }, 0);
     k.innerHTML = "";
     function card(n, label, cls) {
       var c = el("div", "k");
@@ -893,6 +915,7 @@ export const CONSOLE_HTML = `<!doctype html>
     tc.appendChild(el("div", "l", "open by tier"));
     k.appendChild(tc);
     k.appendChild(card(resolved + " / " + closed, "resolved / closed", "good"));
+    k.appendChild(card(fmtMins(minsToday), "logged today"));
   }
 
   async function loadTickets(keepSel) {
@@ -920,6 +943,11 @@ export const CONSOLE_HTML = `<!doctype html>
   async function setClient(ticketId, clientId, assetId) {
     await fetch("/api/ticket/client", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: ticketId, clientId: clientId || "", assetId: assetId || "" }) });
     await loadTickets(true); selectTicket(ticketId, true);
+  }
+  function fmtMins(m) {
+    if (!m) return "0m";
+    var h = Math.floor(m / 60), mm = m % 60;
+    return (h ? h + "h " : "") + (mm ? mm + "m" : (h ? "" : "0m"));
   }
   function slaLabel(s) {
     if (!s) return null;
@@ -1176,6 +1204,29 @@ export const CONSOLE_HTML = `<!doctype html>
       };
       rb.appendChild(ta); rb.appendChild(sb);
       d.appendChild(rb);
+    }
+
+    // Time (billable)
+    var entries = t.timeEntries || [];
+    var totalM = entries.reduce(function(s, e){ return s + (e.minutes || 0); }, 0);
+    if (totalM > 0 || roleAllows("time")) {
+      d.appendChild(el("div", "sec", "Time (" + fmtMins(totalM) + ")"));
+      var tcard = el("div", "card");
+      entries.slice(-6).forEach(function(e){ tcard.appendChild(el("div", "meta", fmtMins(e.minutes) + (e.note ? (" · " + e.note) : "") + (e.by ? (" · " + e.by) : "") + " · " + ago(e.at))); });
+      if (roleAllows("time")) {
+        var trow = el("div", "actions");
+        var lb = el("button", "btn", "Log time");
+        lb.onclick = async function(){
+          var mins = prompt("Minutes spent:"); if (mins === null) return;
+          var n = parseInt(mins, 10); if (!n || n <= 0) { toast("enter a positive number of minutes"); return; }
+          var note = prompt("Note (optional):") || "";
+          await fetch("/api/ticket/time", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: t.id, minutes: n, note: note }) });
+          toast("logged " + n + "m"); await loadTickets(true); selectTicket(t.id, true);
+        };
+        trow.appendChild(lb);
+        tcard.appendChild(trow);
+      }
+      d.appendChild(tcard);
     }
 
     // Thread
