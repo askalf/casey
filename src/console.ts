@@ -400,6 +400,14 @@ export const CONSOLE_HTML = `<!doctype html>
   .feed .ex .es { color:var(--dim); }
   .backbtn { cursor:pointer; color:var(--me); font-size:13px; margin-bottom:8px; display:inline-block; }
   .backbtn:hover { text-decoration:underline; }
+  /* roles */
+  .rolewrap { color:var(--dim); font-size:12px; display:flex; align-items:center; gap:6px; }
+  #role { background:var(--chip); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:5px 8px; font:inherit; }
+  .rolenote { color:var(--dim); font-size:12.5px; background:#10131a; border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:10px; }
+  .planned { max-width:520px; margin:46px auto; text-align:center; background:var(--panel); border:1px dashed #2a2f3a; border-radius:12px; padding:28px; }
+  .planned .pl { font-size:11px; letter-spacing:.08em; color:var(--amber); margin-bottom:8px; }
+  .planned h2 { margin:0 0 8px; }
+  .planned .plb { color:var(--dim); }
   /* User view: chat */
   #user { height:100%; display:flex; align-items:center; justify-content:center; }
   .chat { width:min(560px,94vw); height:min(720px,94%); background:var(--panel); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--line); }
@@ -417,6 +425,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <div class="tab" id="tab-user">User</div>
       <div class="tab active" id="tab-admin">Admin / Dev</div>
     </div>
+    <div class="rolewrap">role <select id="role"></select></div>
     <div class="grow"></div>
     <div class="live" id="live"><span class="dot" id="d-casey"></span>casey
       <span class="dot" id="d-arnie"></span>arnie
@@ -458,7 +467,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner" };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -501,12 +510,70 @@ export const CONSOLE_HTML = `<!doctype html>
   document.getElementById("tab-user").onclick = function(){ setView("user"); };
 
   // ---- admin: list + health ----
+  // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
+  var ROLES = [
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["close","reopen","redispatch","reply"],
+      blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
+    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen"],
+      blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct." },
+    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"priority", actions:["redispatch","close","reply"],
+      blurb:"All open work, highest priority first. (SLA timers + assignment land in Phase 2.)" },
+    { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["redispatch","close","reply"],
+      blurb:"Arnie escalations + outcomes to review. The approve-and-execute gate wires in next." },
+    { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["redispatch","close","reply"],
+      blurb:"Security-classed tickets. A Security-scoped approval gate arrives with the approval workflow." },
+    { id:"backup", label:"Backup", live:false, phase:3, blurb:"Backup-failure queue + restore approvals. Needs alert intake + the asset model." },
+    { id:"bench", label:"Bench", live:false, phase:3, blurb:"Device-prep / imaging / RMA queue. Needs the asset model + procurement handoff." },
+    { id:"procurement", label:"Procurement", live:false, phase:3, blurb:"Purchase orders + vendor management; hands off to Bench." },
+    { id:"project", label:"Project", live:false, phase:4, blurb:"Project board — phases, tasks, assignment, time. Human-run (no AI execution yet)." },
+    { id:"sales", label:"Sales", live:false, phase:5, blurb:"Pipeline + leads; casey splits intake-vs-lead at the front door." },
+    { id:"am", label:"Account Manager", live:false, phase:5, blurb:"Client book, health, QBR reporting. Needs the client model." },
+    { id:"accounting", label:"Accounting / HR", live:false, phase:5, blurb:"Billable time to invoice; contract usage. Needs time tracking." },
+    { id:"dev", label:"Dev", live:false, phase:6, blurb:"Custom work + authoring arnie remediation playbooks." }
+  ];
+  function activeRole() { for (var i=0;i<ROLES.length;i++){ if (ROLES[i].id===state.role) return ROLES[i]; } return ROLES[0]; }
+  function roleScope(t) {
+    var r = activeRole();
+    if (!r.scope) return true;
+    if (r.scope === "escalations") return t.status === "escalated";
+    if (r.scope.indexOf("category:") === 0) return t.category === r.scope.slice(9);
+    return true;
+  }
+  function roleAllows(a) {
+    var r = activeRole();
+    return !!(r.live && r.actions && r.actions.indexOf(a) >= 0);
+  }
+  function applyRole() {
+    var r = activeRole();
+    localStorage.setItem("casey_role", r.id);
+    var sel = document.getElementById("role"); if (sel) sel.value = r.id;
+    if (!r.live) {
+      state.selected = null;
+      var list = document.getElementById("list");
+      list.innerHTML = ""; list.appendChild(el("div", "row", "— view not wired yet —"));
+      var d = document.getElementById("detail"); d.innerHTML = "";
+      var card = el("div", "planned");
+      card.appendChild(el("div", "pl", "PLANNED · PHASE " + r.phase));
+      card.appendChild(el("h2", null, r.label));
+      card.appendChild(el("div", "plb", r.blurb || ""));
+      d.appendChild(card);
+      renderKpi();
+      return;
+    }
+    state.filter = r.filter || "all";
+    var fsel = document.getElementById("filter"); if (fsel) fsel.value = state.filter;
+    renderList();
+    renderKpi();
+    showFeed();
+  }
+
   function matchesSearch(t) {
     var q = state.search.trim().toLowerCase();
     if (!q) return true;
     return [t.subject, t.from, t.id, t.category, t.priority, t.status].some(function(v){ return v && String(v).toLowerCase().indexOf(q) >= 0; });
   }
   function passesFilter(t) {
+    if (!roleScope(t)) return false;
     if (!matchesSearch(t)) return false;
     var f = state.filter;
     if (f === "all") return true;
@@ -515,9 +582,14 @@ export const CONSOLE_HTML = `<!doctype html>
   }
   function renderList() {
     var list = document.getElementById("list");
+    if (!activeRole().live) { list.innerHTML = ""; list.appendChild(el("div", "row", "— view not wired yet —")); return; }
     preserveScroll(list, function() {
       list.innerHTML = "";
       var shown = state.tickets.filter(passesFilter);
+      if (activeRole().sort === "priority") {
+        var ord = { P1:0, P2:1, P3:2, P4:3 };
+        shown.sort(function(a,b){ return (ord[a.priority]==null?9:ord[a.priority]) - (ord[b.priority]==null?9:ord[b.priority]); });
+      }
       if (!shown.length) { list.appendChild(el("div", "row", "No tickets match.")); return; }
       shown.forEach(function(t) {
         var row = el("div", "row" + (t.id === state.selected ? " sel" : ""));
@@ -665,30 +737,41 @@ export const CONSOLE_HTML = `<!doctype html>
     d.appendChild(dh);
     d.appendChild(el("div", "meta", t.id + " · " + (t.channel || "") + " · from " + (t.from || "") + " · created " + ago(t.created_at) + " · updated " + ago(t.updated_at)));
 
-    // Actions (full control)
-    d.appendChild(el("div", "sec", "Actions"));
-    var actions = el("div", "actions");
-    var closeBtn = el("button", "btn warn", t.status === "closed" ? "Reopen" : "Close");
-    closeBtn.onclick = function(){ doAction(t.status === "closed" ? "reopen" : "close", { id: t.id }, t.id); };
-    actions.appendChild(closeBtn);
-    var redo = el("button", "btn", "Re-dispatch to Arnie");
-    redo.onclick = function(){ doAction("redispatch", { id: t.id }, t.id); };
-    actions.appendChild(redo);
-    d.appendChild(actions);
-
-    var rb = el("div", "replybox");
-    var ta = el("textarea"); ta.placeholder = "Reply as Casey…";
-    var sb = el("button", "btn primary", "Send reply");
-    sb.onclick = async function(){
-      var text = ta.value.trim();
-      if (!text) return;
-      sb.disabled = true;
-      var r = await doAction("reply", { id: t.id, text: text }, t.id, true);
-      sb.disabled = false;
-      if (r) { ta.value = ""; if (r.note) toast(r.note); }
-    };
-    rb.appendChild(ta); rb.appendChild(sb);
-    d.appendChild(rb);
+    // Actions (role-scoped)
+    var canClose = roleAllows(t.status === "closed" ? "reopen" : "close");
+    var canRedo = roleAllows("redispatch");
+    var canReply = roleAllows("reply");
+    if (canClose || canRedo) {
+      d.appendChild(el("div", "sec", "Actions"));
+      var actions = el("div", "actions");
+      if (canClose) {
+        var closeBtn = el("button", "btn warn", t.status === "closed" ? "Reopen" : "Close");
+        closeBtn.onclick = function(){ doAction(t.status === "closed" ? "reopen" : "close", { id: t.id }, t.id); };
+        actions.appendChild(closeBtn);
+      }
+      if (canRedo) {
+        var redo = el("button", "btn", "Re-dispatch to Arnie");
+        redo.onclick = function(){ doAction("redispatch", { id: t.id }, t.id); };
+        actions.appendChild(redo);
+      }
+      d.appendChild(actions);
+    }
+    if (canReply) {
+      d.appendChild(el("div", "sec", "Reply as Casey"));
+      var rb = el("div", "replybox");
+      var ta = el("textarea"); ta.placeholder = "Reply as Casey…";
+      var sb = el("button", "btn primary", "Send reply");
+      sb.onclick = async function(){
+        var text = ta.value.trim();
+        if (!text) return;
+        sb.disabled = true;
+        var rr = await doAction("reply", { id: t.id, text: text }, t.id, true);
+        sb.disabled = false;
+        if (rr) { ta.value = ""; if (rr.note) toast(rr.note); }
+      };
+      rb.appendChild(ta); rb.appendChild(sb);
+      d.appendChild(rb);
+    }
 
     // Thread
     d.appendChild(el("div", "sec", "Thread (" + (t.thread ? t.thread.length : 0) + ")"));
@@ -786,6 +869,8 @@ export const CONSOLE_HTML = `<!doctype html>
     renderList();
     var d = document.getElementById("detail");
     d.innerHTML = "";
+    var r = activeRole();
+    if (r.blurb) d.appendChild(el("div", "rolenote", r.label + " — " + r.blurb));
     d.appendChild(el("div", "sec", "Activity"));
     var feed = el("div", "feed"); feed.id = "feed";
     d.appendChild(feed);
@@ -843,15 +928,25 @@ export const CONSOLE_HTML = `<!doctype html>
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("uform").requestSubmit(); }
   });
 
+  // ---- roles: populate switcher ----
+  (function(){
+    state.role = localStorage.getItem("casey_role") || "owner";
+    var sel = document.getElementById("role");
+    ROLES.forEach(function(r){ var o = document.createElement("option"); o.value = r.id; o.textContent = r.label + (r.live ? "" : " · planned"); sel.appendChild(o); });
+    sel.value = state.role;
+    sel.onchange = function(e){ state.role = e.target.value; applyRole(); };
+  })();
+
   // ---- boot + auto-refresh ----
   setView("admin");
-  showFeed();
+  applyRole();
   loadTickets(false);
   loadHealth();
   setInterval(function(){
     if (state.view !== "admin") return;
     loadTickets(true);
     loadHealth();
+    if (!activeRole().live) return;
     if (state.selected) selectTicket(state.selected);   // change-detected + scroll-preserving
     else loadActivity();
   }, 5000);
