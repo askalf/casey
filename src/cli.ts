@@ -218,6 +218,7 @@ async function cmdServe(config: Config): Promise<void> {
     const byName = new Map(channels.map((c) => [c.name, c]));
     registerConsole(server, {
       ticketStore: config.ticketStore,
+      clientStore: path.join(path.dirname(config.ticketStore), "clients.jsonl"),
       arnieQueue: config.arnieQueue,
       darioUrl: config.dario ? config.baseUrl ?? "http://localhost:3456" : config.baseUrl,
       deliver: async (ticket, text) => {
