@@ -16,6 +16,7 @@ export interface Config {
   teams: boolean; // MS Teams Bot Framework (env: TEAMS_APP_ID, TEAMS_APP_PASSWORD)
   sms: boolean; // Twilio SMS (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER)
   voice: boolean; // Twilio Voice (env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  trustAccessHeader: boolean; // trust Cf-Access-Authenticated-User-Email (set ONLY behind CF Access)
   showHelp: boolean;
   showVersion: boolean;
 }
@@ -32,6 +33,7 @@ const DEFAULTS: Config = {
   teams: false,
   sms: false,
   voice: false,
+  trustAccessHeader: false,
   showHelp: false,
   showVersion: false,
 };
@@ -97,6 +99,9 @@ export function parseArgs(argv: string[]): { config: Config; command: string; ar
       case "--voice":
         config.voice = true;
         break;
+      case "--trust-access-header":
+        config.trustAccessHeader = true;
+        break;
       case "--port": {
         const v = parseInt(next("--port"), 10);
         if (!Number.isFinite(v) || v <= 0 || v > 65535) throw new Error("--port must be a port number (1-65535)");
@@ -146,6 +151,9 @@ Options:
   --email-config <f>   Path to the IMAP/SMTP config (default: ~/.casey/email.json)
   --interval <sec>     Seconds between inbox polls in serve (default: 30)
   --ticket-store <f>   Ticket log JSONL (default: ~/.casey/tickets.jsonl)
+  --trust-access-header  Trust Cloudflare Access identity (Cf-Access-Authenticated-User-Email)
+                       for the console — set ONLY when casey is behind CF Access; the email
+                       maps to a role via <store-dir>/roles.json. Ignored otherwise.
   --version            Print version
   -h, --help           Show this help
 
