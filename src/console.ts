@@ -107,6 +107,7 @@ function summarize(t: Ticket): Record<string, unknown> {
     sla: computeSla(t),
     minutes: (t.timeEntries ?? []).reduce((s, e) => s + (e.minutes || 0), 0),
     minutesToday: (t.timeEntries ?? []).filter((e) => (e.at || "").slice(0, 10) === new Date().toISOString().slice(0, 10)).reduce((s, e) => s + (e.minutes || 0), 0),
+    procurement: t.procurement ?? null,
   };
 }
 
@@ -280,6 +281,22 @@ async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespons
     }
   }
   return json(200, { ok: true, delivered, note, ticket: summarize(t) });
+}
+
+/** Advance a ticket's procurement flow (requested → ordered → received). */
+async function setProcurement(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  if (!id) return json(400, { error: "missing id" });
+  const status = String(body.status ?? "");
+  if (["requested", "ordered", "received"].indexOf(status) < 0) return json(400, { error: "status must be requested|ordered|received" });
+  const t = await findTicket(ctx, id);
+  if (!t) return json(404, { error: "not found" });
+  const item = body.item != null ? String(body.item) : t.procurement?.item;
+  t.procurement = { status: status as "requested" | "ordered" | "received", item, at: new Date().toISOString() };
+  t.updated_at = new Date().toISOString();
+  await saveTicket(ctx.ticketStore, t);
+  return json(200, { ok: true, procurement: t.procurement });
 }
 
 /** Log billable time against a ticket. */
@@ -502,6 +519,7 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/ticket/client", (req) => setTicketClient(ctx, req));
   server.route("POST", "/api/ticket/assign", (req) => assignTicket(ctx, req));
   server.route("POST", "/api/ticket/time", (req) => logTime(ctx, req));
+  server.route("POST", "/api/ticket/procurement", (req) => setProcurement(ctx, req));
   server.route("GET", "/api/projects", async () => json(200, { projects: await loadProjects(ctx.projectStore) }));
   server.route("GET", "/api/project", async (req) => {
     const id = req.query.id;
@@ -733,19 +751,22 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- admin: list + health ----
   // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
   var ROLES = [
-    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client","assign","time"],
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client","assign","time","request_procure"],
       blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
-    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client","time"],
+    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client","time","request_procure"],
       blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct. Set the client + asset." },
-    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"sla", actions:["assign","redispatch","close","reply","client","time"],
+    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"sla", actions:["assign","redispatch","close","reply","client","time","request_procure"],
       blurb:"All open work, most SLA-urgent first. Assign owners; watch breaches." },
     { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply","time"],
       blurb:"Arnie escalations awaiting sign-off. Approve authorizes the proposed remediation (arnie executes once execute-on-approval ships); reject sends it back." },
     { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["approve","reject","redispatch","close","reply","time"],
       blurb:"Security-classed tickets + escalations to sign off on." },
-    { id:"backup", label:"Backup", live:false, phase:3, blurb:"Backup-failure queue + restore approvals. Needs alert intake + the asset model." },
-    { id:"bench", label:"Bench", live:false, phase:3, blurb:"Device-prep / imaging / RMA queue. Needs the asset model + procurement handoff." },
-    { id:"procurement", label:"Procurement", live:false, phase:3, blurb:"Purchase orders + vendor management; hands off to Bench." },
+    { id:"backup", label:"Backup", live:true, scope:"category:data", filter:"all", actions:["approve","reject","redispatch","close","reply","time"],
+      blurb:"Backup-failure tickets + restore requests. Restores are data-risk — they gate to Backup sign-off." },
+    { id:"bench", label:"Bench", live:true, scope:"bench", filter:"all", actions:["assign","close","reply","time","client"],
+      blurb:"Hardware / depot: imaging, staging, repair, RMA. Items marked received by Procurement land here automatically." },
+    { id:"procurement", label:"Procurement", live:true, scope:"procurement", filter:"all", actions:["procure","close","reply"],
+      blurb:"Purchase requests → ordered → received. Marking an item received hands it off to Bench." },
     { id:"project", label:"Project", live:true, board:"project", blurb:"Project board — onboardings, migrations, rollouts. Human-run: tasks, status, assignment (no AI execution yet)." },
     { id:"sales", label:"Sales", live:false, phase:5, blurb:"Pipeline + leads; casey splits intake-vs-lead at the front door." },
     { id:"am", label:"Account Manager", live:true, board:"clients", blurb:"Client book — per-client health, open work, SLA breaches, hours. Relationship + reporting view." },
@@ -757,6 +778,8 @@ export const CONSOLE_HTML = `<!doctype html>
     var r = activeRole();
     if (!r.scope) return true;
     if (r.scope === "escalations") return t.status === "escalated";
+    if (r.scope === "procurement") return !!t.procurement;
+    if (r.scope === "bench") return t.category === "hardware" || (t.procurement && t.procurement.status === "received");
     if (r.scope.indexOf("category:") === 0) return t.category === r.scope.slice(9);
     return true;
   }
@@ -833,6 +856,7 @@ export const CONSOLE_HTML = `<!doctype html>
         if (t.status === "escalated" && !t.approval) sub.appendChild(el("span", "chip", "⏳ approve"));
         var cn = t.clientId ? clientName(t.clientId) : null;
         if (cn) sub.appendChild(el("span", "chip", cn));
+        if (t.procurement) sub.appendChild(el("span", "chip", "⛟ " + t.procurement.status));
         if (t.sla && t.sla.state && t.sla.state !== "ok" && t.sla.state !== "met") sub.appendChild(el("span", "chip sla-" + t.sla.state, slaLabel(t.sla) || t.sla.state));
         if (t.assignee) sub.appendChild(el("span", null, "· @" + t.assignee));
         sub.appendChild(el("span", null, "· " + (t.from || "")));
@@ -1251,6 +1275,29 @@ export const CONSOLE_HTML = `<!doctype html>
         cc.appendChild(crow);
       }
       d.appendChild(cc);
+    }
+
+    // Procurement (hardware/licenses; received items hand off to Bench)
+    var proc = t.procurement;
+    if (proc || roleAllows("procure") || roleAllows("request_procure")) {
+      d.appendChild(el("div", "sec", "Procurement"));
+      var prc = el("div", "card");
+      prc.appendChild(el("div", null, "status: " + (proc ? proc.status : "— none —") + (proc && proc.item ? (" · " + proc.item) : "")));
+      var prow = el("div", "actions");
+      if (!proc && roleAllows("request_procure")) {
+        var rq = el("button", "btn", "Request procurement");
+        rq.onclick = async function(){ var item = prompt("What needs procuring? (item / description)"); if (item === null) return; await fetch("/api/ticket/procurement", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: t.id, status: "requested", item: item }) }); toast("procurement requested"); await loadTickets(true); selectTicket(t.id, true); };
+        prow.appendChild(rq);
+      }
+      if (roleAllows("procure")) {
+        ["requested","ordered","received"].forEach(function(s){
+          var b = el("button", "btn" + (proc && proc.status === s ? " primary" : ""), s);
+          b.onclick = async function(){ await fetch("/api/ticket/procurement", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: t.id, status: s }) }); toast("procurement: " + s + (s === "received" ? " → Bench" : "")); await loadTickets(true); selectTicket(t.id, true); };
+          prow.appendChild(b);
+        });
+      }
+      if (prow.childNodes.length) prc.appendChild(prow);
+      d.appendChild(prc);
     }
 
     // Actions (role-scoped)

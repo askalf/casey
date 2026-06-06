@@ -41,6 +41,8 @@ export interface Ticket {
   assignee?: string;
   /** Billable time logged against this ticket. */
   timeEntries?: { id: string; minutes: number; by?: string; note?: string; at: string }[];
+  /** Procurement flow for hardware/licenses; received items hand off to Bench. */
+  procurement?: { status: "requested" | "ordered" | "received"; item?: string; at?: string };
 }
 
 /** A bare inbound ticket — the minimum to triage. */
