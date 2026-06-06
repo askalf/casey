@@ -34,6 +34,9 @@ export interface Ticket {
   routed_to?: string;
   /** T3 / discipline sign-off on an escalated (proposed) remediation. */
   approval?: { decision: "approved" | "rejected"; by: string; at: string; note?: string };
+  /** MSP client + asset this ticket belongs to (set by CSR/Dispatch). */
+  clientId?: string;
+  assetId?: string;
 }
 
 /** A bare inbound ticket — the minimum to triage. */

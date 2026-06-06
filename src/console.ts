@@ -2,6 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import { loadTickets, saveTicket, addTurn, type Ticket } from "./ticket.js";
+import { loadClients, saveClient, newClient, newAsset, type Client } from "./clients.js";
 import type { ChannelServer, ServerRequest, ServerResponse } from "./channels/types.js";
 
 /**
@@ -14,6 +15,8 @@ import type { ChannelServer, ServerRequest, ServerResponse } from "./channels/ty
  */
 export interface ConsoleCtx {
   ticketStore: string;
+  /** Client + asset registry (JSONL). */
+  clientStore: string;
   /** arnie hand-off queue root (tasks live in <queue>/inbox, outcomes alongside). */
   arnieQueue?: string;
   /** dario / LLM base URL, probed for the health panel. */
@@ -67,6 +70,8 @@ function summarize(t: Ticket): Record<string, unknown> {
     action: t.triage?.action ?? null,
     turns: t.thread?.length ?? 0,
     approval: t.approval ?? null,
+    clientId: t.clientId ?? null,
+    assetId: t.assetId ?? null,
   };
 }
 
@@ -242,6 +247,45 @@ async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespons
   return json(200, { ok: true, delivered, note, ticket: summarize(t) });
 }
 
+/** Attach (or clear) a client + asset on a ticket. */
+async function setTicketClient(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  if (!id) return json(400, { error: "missing id" });
+  const t = await findTicket(ctx, id);
+  if (!t) return json(404, { error: "not found" });
+  t.clientId = body.clientId != null && body.clientId !== "" ? String(body.clientId) : undefined;
+  t.assetId = body.assetId != null && body.assetId !== "" ? String(body.assetId) : undefined;
+  t.updated_at = new Date().toISOString();
+  await saveTicket(ctx.ticketStore, t);
+  return json(200, { ok: true, clientId: t.clientId ?? null, assetId: t.assetId ?? null });
+}
+
+async function createClient(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const name = String(body.name ?? "").trim();
+  if (!name) return json(400, { error: "missing name" });
+  const domain = body.domain != null ? String(body.domain).trim() || undefined : undefined;
+  const c = newClient(name, domain);
+  await saveClient(ctx.clientStore, c);
+  return json(200, { ok: true, client: c });
+}
+
+async function addClientAsset(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const clientId = String(body.clientId ?? "");
+  const name = String(body.name ?? "").trim();
+  if (!clientId || !name) return json(400, { error: "missing clientId or name" });
+  const clients = await loadClients(ctx.clientStore);
+  const c = clients.find((x) => x.id === clientId);
+  if (!c) return json(404, { error: "client not found" });
+  const a = newAsset(name, body.type != null ? String(body.type) : undefined);
+  c.assets = c.assets || [];
+  c.assets.push(a);
+  await saveClient(ctx.clientStore, c);
+  return json(200, { ok: true, asset: a, client: c });
+}
+
 interface ActivityEvent {
   at: string;
   actor: string;
@@ -329,6 +373,10 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/ticket/reply", (req) => reply(ctx, req));
   server.route("POST", "/api/ticket/approve", (req) => decide(ctx, req, "approved"));
   server.route("POST", "/api/ticket/reject", (req) => decide(ctx, req, "rejected"));
+  server.route("GET", "/api/clients", async () => json(200, { clients: await loadClients(ctx.clientStore) }));
+  server.route("POST", "/api/clients", (req) => createClient(ctx, req));
+  server.route("POST", "/api/client/asset", (req) => addClientAsset(ctx, req));
+  server.route("POST", "/api/ticket/client", (req) => setTicketClient(ctx, req));
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +544,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner" };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [] };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -541,11 +589,11 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- admin: list + health ----
   // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
   var ROLES = [
-    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply"],
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply","client"],
       blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
-    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen"],
-      blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct." },
-    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"priority", actions:["redispatch","close","reply"],
+    { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen","client"],
+      blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct. Set the client + asset." },
+    { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"priority", actions:["redispatch","close","reply","client"],
       blurb:"All open work, highest priority first. (SLA timers + assignment land in Phase 2.)" },
     { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply"],
       blurb:"Arnie escalations awaiting sign-off. Approve authorizes the proposed remediation (arnie executes once execute-on-approval ships); reject sends it back." },
@@ -628,6 +676,8 @@ export const CONSOLE_HTML = `<!doctype html>
         if (t.priority) sub.appendChild(el("span", "chip", t.priority));
         sub.appendChild(el("span", "st-" + t.status, t.status));
         if (t.status === "escalated" && !t.approval) sub.appendChild(el("span", "chip", "⏳ approve"));
+        var cn = t.clientId ? clientName(t.clientId) : null;
+        if (cn) sub.appendChild(el("span", "chip", cn));
         sub.appendChild(el("span", null, "· " + (t.from || "")));
         row.appendChild(sub);
         row.appendChild(el("div", "sub", ago(t.updated_at) + " · " + (t.channel || "")));
@@ -723,6 +773,16 @@ export const CONSOLE_HTML = `<!doctype html>
       renderHealth(await res.json());
     } catch (e) { /* transient */ }
   }
+  async function loadClientsList() {
+    try { var res = await fetch("/api/clients"); var d = await res.json(); state.clients = d.clients || []; } catch (e) { /* transient */ }
+  }
+  function clientById(id) { for (var i=0;i<state.clients.length;i++){ if (state.clients[i].id === id) return state.clients[i]; } return null; }
+  function clientName(id) { var c = clientById(id); return c ? c.name : null; }
+  function assetName(cid, aid) { var c = clientById(cid); if (!c || !c.assets) return null; for (var i=0;i<c.assets.length;i++){ if (c.assets[i].id === aid) return c.assets[i].name; } return null; }
+  async function setClient(ticketId, clientId, assetId) {
+    await fetch("/api/ticket/client", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: ticketId, clientId: clientId || "", assetId: assetId || "" }) });
+    await loadTickets(true); selectTicket(ticketId, true);
+  }
 
   // ---- admin: detail ----
   function detailSig(t, arnie) {
@@ -768,6 +828,55 @@ export const CONSOLE_HTML = `<!doctype html>
     dh.appendChild(el("span", "chip st-" + t.status, t.status));
     d.appendChild(dh);
     d.appendChild(el("div", "meta", t.id + " · " + (t.channel || "") + " · from " + (t.from || "") + " · created " + ago(t.created_at) + " · updated " + ago(t.updated_at)));
+
+    // Client / Asset
+    var cName = t.clientId ? (clientName(t.clientId) || t.clientId) : null;
+    var aName = (t.clientId && t.assetId) ? (assetName(t.clientId, t.assetId) || t.assetId) : null;
+    if (cName || roleAllows("client")) {
+      d.appendChild(el("div", "sec", "Client / Asset"));
+      var cc = el("div", "card");
+      cc.appendChild(el("div", null, "client: " + (cName || "— unassigned —") + (aName ? ("   ·   asset: " + aName) : "")));
+      if (roleAllows("client")) {
+        var crow = el("div", "actions");
+        var csel = document.createElement("select"); csel.className = "btn";
+        var on = document.createElement("option"); on.value = ""; on.textContent = "— client —"; csel.appendChild(on);
+        state.clients.forEach(function(c){ var o = document.createElement("option"); o.value = c.id; o.textContent = c.name; csel.appendChild(o); });
+        var onew = document.createElement("option"); onew.value = "__new"; onew.textContent = "+ new client…"; csel.appendChild(onew);
+        csel.value = t.clientId || "";
+        csel.onchange = async function(){
+          if (csel.value === "__new") {
+            var nm = prompt("New client name:"); if (!nm) { csel.value = t.clientId || ""; return; }
+            var r = await fetch("/api/clients", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ name: nm }) });
+            var dd = await r.json(); if (dd.client) { await loadClientsList(); toast("client created"); await setClient(t.id, dd.client.id, ""); }
+            return;
+          }
+          await setClient(t.id, csel.value, "");
+          toast("client set");
+        };
+        crow.appendChild(csel);
+        if (t.clientId) {
+          var c = clientById(t.clientId);
+          var asel = document.createElement("select"); asel.className = "btn";
+          var an = document.createElement("option"); an.value = ""; an.textContent = "— asset —"; asel.appendChild(an);
+          ((c && c.assets) || []).forEach(function(a){ var o = document.createElement("option"); o.value = a.id; o.textContent = a.name; asel.appendChild(o); });
+          var anew = document.createElement("option"); anew.value = "__new"; anew.textContent = "+ new asset…"; asel.appendChild(anew);
+          asel.value = t.assetId || "";
+          asel.onchange = async function(){
+            if (asel.value === "__new") {
+              var nm = prompt("New asset (hostname / label):"); if (!nm) { asel.value = t.assetId || ""; return; }
+              var r = await fetch("/api/client/asset", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ clientId: t.clientId, name: nm }) });
+              var dd = await r.json(); if (dd.asset) { await loadClientsList(); toast("asset added"); await setClient(t.id, t.clientId, dd.asset.id); }
+              return;
+            }
+            await setClient(t.id, t.clientId, asel.value);
+            toast("asset set");
+          };
+          crow.appendChild(asel);
+        }
+        cc.appendChild(crow);
+      }
+      d.appendChild(cc);
+    }
 
     // Actions (role-scoped)
     var canClose = roleAllows(t.status === "closed" ? "reopen" : "close");
@@ -993,6 +1102,7 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- boot + auto-refresh ----
   setView("admin");
   applyRole();
+  loadClientsList().then(function(){ renderList(); });
   loadTickets(false);
   loadHealth();
   setInterval(function(){

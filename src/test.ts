@@ -331,6 +331,7 @@ async function voiceTests(): Promise<void> {
 async function consoleTests(): Promise<void> {
   const store = path.join(os.tmpdir(), `casey-console-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const queue = path.join(os.tmpdir(), `casey-console-q-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`);
+  const cstore = path.join(os.tmpdir(), `casey-console-c-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const get = (p: string, query: Record<string, string> = {}): ServerRequest => ({ method: "GET", path: p, query, headers: {}, body: "" });
   const post = (p: string, body: unknown): ServerRequest => ({ method: "POST", path: p, query: {}, headers: {}, body: JSON.stringify(body) });
   try {
@@ -344,7 +345,7 @@ async function consoleTests(): Promise<void> {
     await saveTicket(store, b);
 
     const server = new MockServer();
-    registerConsole(server, { ticketStore: store, arnieQueue: queue, darioUrl: undefined });
+    registerConsole(server, { ticketStore: store, clientStore: cstore, arnieQueue: queue, darioUrl: undefined });
 
     check(
       "console: registers page + api routes",
@@ -352,7 +353,9 @@ async function consoleTests(): Promise<void> {
         server.routes.has("GET /api/health") && server.routes.has("GET /api/activity") && server.routes.has("POST /api/ticket/close") &&
         server.routes.has("POST /api/ticket/reopen") && server.routes.has("POST /api/ticket/redispatch") &&
         server.routes.has("POST /api/ticket/reply") && server.routes.has("POST /api/ticket/approve") &&
-        server.routes.has("POST /api/ticket/reject"),
+        server.routes.has("POST /api/ticket/reject") && server.routes.has("GET /api/clients") &&
+        server.routes.has("POST /api/clients") && server.routes.has("POST /api/client/asset") &&
+        server.routes.has("POST /api/ticket/client"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -422,9 +425,28 @@ async function consoleTests(): Promise<void> {
 
     const apMissing = await server.routes.get("POST /api/ticket/approve")!(post("/api/ticket/approve", {}));
     check("console: approve without id → 400", apMissing.status === 400);
+
+    const cc = await server.routes.get("POST /api/clients")!(post("/api/clients", { name: "Acme Co", domain: "acme.com" }));
+    const ccBody = JSON.parse(cc.body) as { ok: boolean; client: { id: string; name: string } };
+    check("console: create client", cc.status === 200 && ccBody.ok && ccBody.client.name === "Acme Co");
+    const clientId = ccBody.client.id;
+
+    const as = await server.routes.get("POST /api/client/asset")!(post("/api/client/asset", { clientId, name: "FS01", type: "server" }));
+    const asBody = JSON.parse(as.body) as { ok: boolean; asset: { id: string; name: string } };
+    check("console: add asset to client", as.status === 200 && asBody.ok && asBody.asset.name === "FS01");
+    const assetId = asBody.asset.id;
+
+    const listC = JSON.parse((await server.routes.get("GET /api/clients")!(get("/api/clients"))).body) as { clients: Array<{ id: string; assets: Array<{ id: string }> }> };
+    const foundC = listC.clients.find((c) => c.id === clientId);
+    check("console: client list includes the new client + asset", !!foundC && foundC.assets.some((x) => x.id === assetId), JSON.stringify({ n: listC.clients.length }));
+
+    const sc = await server.routes.get("POST /api/ticket/client")!(post("/api/ticket/client", { id: a.id, clientId, assetId }));
+    const afterSc = (await loadTickets(store)).find((t) => t.id === a.id);
+    check("console: set client+asset on a ticket", sc.status === 200 && afterSc?.clientId === clientId && afterSc?.assetId === assetId, JSON.stringify({ c: afterSc?.clientId, a: afterSc?.assetId }));
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(cstore, { force: true }).catch(() => {});
   }
 }
 
