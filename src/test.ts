@@ -351,7 +351,8 @@ async function consoleTests(): Promise<void> {
       server.routes.has("GET /console") && server.routes.has("GET /api/tickets") && server.routes.has("GET /api/ticket") &&
         server.routes.has("GET /api/health") && server.routes.has("GET /api/activity") && server.routes.has("POST /api/ticket/close") &&
         server.routes.has("POST /api/ticket/reopen") && server.routes.has("POST /api/ticket/redispatch") &&
-        server.routes.has("POST /api/ticket/reply"),
+        server.routes.has("POST /api/ticket/reply") && server.routes.has("POST /api/ticket/approve") &&
+        server.routes.has("POST /api/ticket/reject"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -402,6 +403,25 @@ async function consoleTests(): Promise<void> {
         act.events.some((e) => e.kind === "status" && e.status === "escalated"),
       `events=${act.events.length}`,
     );
+
+    const apr = await server.routes.get("POST /api/ticket/approve")!(post("/api/ticket/approve", { id: b.id, by: "t3-test", note: "go" }));
+    const aprBody = JSON.parse(apr.body) as { ok: boolean; approval: { decision: string; by: string; note?: string } };
+    const decFile = path.join(queue, "inbox", b.id + ".decision.json");
+    const dec = JSON.parse(await fsp.readFile(decFile, "utf8").catch(() => "{}")) as { decision?: string; by?: string };
+    const afterApr = (await loadTickets(store)).find((t) => t.id === b.id);
+    check(
+      "console: approve records sign-off + writes decision file",
+      apr.status === 200 && aprBody.ok && aprBody.approval.decision === "approved" && afterApr?.approval?.decision === "approved" &&
+        afterApr?.approval?.by === "t3-test" && dec.decision === "approved" && dec.by === "t3-test",
+      JSON.stringify({ tkt: afterApr?.approval?.decision, file: dec.decision }),
+    );
+
+    const rej = await server.routes.get("POST /api/ticket/reject")!(post("/api/ticket/reject", { id: b.id }));
+    const afterRej = (await loadTickets(store)).find((t) => t.id === b.id);
+    check("console: reject flips the recorded decision", rej.status === 200 && afterRej?.approval?.decision === "rejected", afterRej?.approval?.decision);
+
+    const apMissing = await server.routes.get("POST /api/ticket/approve")!(post("/api/ticket/approve", {}));
+    check("console: approve without id → 400", apMissing.status === 400);
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});

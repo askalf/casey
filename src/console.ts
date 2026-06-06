@@ -66,6 +66,7 @@ function summarize(t: Ticket): Record<string, unknown> {
     category: t.triage?.category ?? null,
     action: t.triage?.action ?? null,
     turns: t.thread?.length ?? 0,
+    approval: t.approval ?? null,
   };
 }
 
@@ -186,6 +187,32 @@ async function redispatch(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRe
   return json(200, { ok: true, routed_to: file });
 }
 
+/**
+ * T3 / discipline sign-off on an escalated remediation. Records the decision on
+ * the ticket AND drops a <id>.decision.json into arnie's queue — the contract
+ * arnie will read to execute-on-approval or stand down (the execute side lands
+ * as its own change; this writes the decision regardless so it's ready).
+ */
+async function decide(ctx: ConsoleCtx, req: ServerRequest, decision: "approved" | "rejected"): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  if (!id) return json(400, { error: "missing id" });
+  const t = await findTicket(ctx, id);
+  if (!t) return json(404, { error: "not found" });
+  const by = body.by != null ? String(body.by) : "console";
+  const note = body.note != null ? String(body.note) : undefined;
+  const at = new Date().toISOString();
+  t.approval = { decision, by, at, note };
+  t.updated_at = at;
+  await saveTicket(ctx.ticketStore, t);
+  if (ctx.arnieQueue) {
+    const inbox = path.join(ctx.arnieQueue, "inbox");
+    await fsp.mkdir(inbox, { recursive: true }).catch(() => {});
+    await fsp.writeFile(path.join(inbox, id + ".decision.json"), JSON.stringify({ ticketId: id, decision, by, at, note }, null, 2), "utf8");
+  }
+  return json(200, { ok: true, approval: t.approval });
+}
+
 /** Operator joins the thread as Casey. Records the turn; delivers it for push channels. */
 async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
   const body = parseBody(req);
@@ -300,6 +327,8 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/ticket/reopen", (req) => mutateStatus(ctx, req, "awaiting_client"));
   server.route("POST", "/api/ticket/redispatch", (req) => redispatch(ctx, req));
   server.route("POST", "/api/ticket/reply", (req) => reply(ctx, req));
+  server.route("POST", "/api/ticket/approve", (req) => decide(ctx, req, "approved"));
+  server.route("POST", "/api/ticket/reject", (req) => decide(ctx, req, "rejected"));
 }
 
 // ---------------------------------------------------------------------------
@@ -512,16 +541,16 @@ export const CONSOLE_HTML = `<!doctype html>
   // ---- admin: list + health ----
   // ---- roles: each team is a scoped view of the one pane (no auth yet) ----
   var ROLES = [
-    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["close","reopen","redispatch","reply"],
+    { id:"owner", label:"Owner / Manager", live:true, filter:"all", actions:["approve","reject","close","reopen","redispatch","reply"],
       blurb:"Oversight — the whole desk. KPIs up top, live activity below." },
     { id:"csr", label:"Service Desk / CSR", live:true, filter:"open", actions:["reply","close","reopen"],
       blurb:"Intake + triage. Use the User tab to take a ticket — casey drafts the triage, you confirm/correct." },
     { id:"dispatch", label:"Dispatch", live:true, filter:"open", sort:"priority", actions:["redispatch","close","reply"],
       blurb:"All open work, highest priority first. (SLA timers + assignment land in Phase 2.)" },
-    { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["redispatch","close","reply"],
-      blurb:"Arnie escalations + outcomes to review. The approve-and-execute gate wires in next." },
-    { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["redispatch","close","reply"],
-      blurb:"Security-classed tickets. A Security-scoped approval gate arrives with the approval workflow." },
+    { id:"t3", label:"T3 / Approver", live:true, scope:"escalations", filter:"all", actions:["approve","reject","redispatch","close","reply"],
+      blurb:"Arnie escalations awaiting sign-off. Approve authorizes the proposed remediation (arnie executes once execute-on-approval ships); reject sends it back." },
+    { id:"security", label:"Security", live:true, scope:"category:security", filter:"all", actions:["approve","reject","redispatch","close","reply"],
+      blurb:"Security-classed tickets + escalations to sign off on." },
     { id:"backup", label:"Backup", live:false, phase:3, blurb:"Backup-failure queue + restore approvals. Needs alert intake + the asset model." },
     { id:"bench", label:"Bench", live:false, phase:3, blurb:"Device-prep / imaging / RMA queue. Needs the asset model + procurement handoff." },
     { id:"procurement", label:"Procurement", live:false, phase:3, blurb:"Purchase orders + vendor management; hands off to Bench." },
@@ -598,6 +627,7 @@ export const CONSOLE_HTML = `<!doctype html>
         sub.appendChild(tierChip(t.tier));
         if (t.priority) sub.appendChild(el("span", "chip", t.priority));
         sub.appendChild(el("span", "st-" + t.status, t.status));
+        if (t.status === "escalated" && !t.approval) sub.appendChild(el("span", "chip", "⏳ approve"));
         sub.appendChild(el("span", null, "· " + (t.from || "")));
         row.appendChild(sub);
         row.appendChild(el("div", "sub", ago(t.updated_at) + " · " + (t.channel || "")));
@@ -653,6 +683,7 @@ export const CONSOLE_HTML = `<!doctype html>
     var byTier = {1:0,2:0,3:0};
     open.forEach(function(t){ if (t.tier) byTier[t.tier] = (byTier[t.tier]||0)+1; });
     var pending = state.health && state.health.arnie ? (state.health.arnie.pending||0) : 0;
+    var needsAppr = ts.filter(function(t){ return t.status === "escalated" && !t.approval; }).length;
     k.innerHTML = "";
     function card(n, label, cls) {
       var c = el("div", "k");
@@ -663,6 +694,7 @@ export const CONSOLE_HTML = `<!doctype html>
     k.appendChild(card(open.length, "open", open.length ? "" : "good"));
     k.appendChild(card(p1.length, "P1 open", p1.length ? "bad" : ""));
     k.appendChild(card(today.length, "today"));
+    k.appendChild(card(needsAppr, "needs approval", needsAppr ? "warn" : ""));
     k.appendChild(card(pending, "escalating→arnie", pending ? "warn" : ""));
     var tc = el("div", "k");
     var bars = el("div", "bars");
@@ -818,6 +850,27 @@ export const CONSOLE_HTML = `<!doctype html>
       ac.appendChild(el("div", "meta", "not escalated to Arnie."));
     }
     d.appendChild(ac);
+
+    // Approval — T3 / discipline sign-off on an escalated remediation
+    var ap = t.approval;
+    var canApprove = roleAllows("approve");
+    var canReject = roleAllows("reject");
+    if (ap || (t.status === "escalated" && (canApprove || canReject))) {
+      d.appendChild(el("div", "sec", "Approval"));
+      var apc = el("div", "card");
+      if (ap) {
+        apc.appendChild(el("div", null, (ap.decision === "approved" ? "✓ APPROVED" : "✗ REJECTED") + " · " + ap.by + " · " + ago(ap.at) + (ap.note ? (" · " + ap.note) : "")));
+      } else {
+        apc.appendChild(el("div", "meta", "Escalated for sign-off. Approve authorizes the proposed remediation (arnie execute-on-approval ships next); reject sends it back."));
+      }
+      if (canApprove || canReject) {
+        var arow = el("div", "actions");
+        if (canApprove) { var ab = el("button", "btn primary", ap ? "Re-approve" : "Approve"); ab.onclick = function(){ doAction("approve", { id: t.id }, t.id); }; arow.appendChild(ab); }
+        if (canReject) { var rjb = el("button", "btn warn", "Reject"); rjb.onclick = function(){ doAction("reject", { id: t.id }, t.id); }; arow.appendChild(rjb); }
+        apc.appendChild(arow);
+      }
+      d.appendChild(apc);
+    }
   }
 
   // ---- admin: activity feed (default detail view) ----

@@ -32,6 +32,8 @@ export interface Ticket {
   thread: ThreadTurn[];
   /** Path of the arnie task file, when escalated to Tier-3. */
   routed_to?: string;
+  /** T3 / discipline sign-off on an escalated (proposed) remediation. */
+  approval?: { decision: "approved" | "rejected"; by: string; at: string; note?: string };
 }
 
 /** A bare inbound ticket — the minimum to triage. */
