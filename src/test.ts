@@ -23,6 +23,7 @@ import { DiscordChannel } from "./channels/discord.js";
 import { SmsChannel } from "./channels/sms.js";
 import { VoiceChannel } from "./channels/voice.js";
 import { verifyTwilio, formParams } from "./channels/twilio-common.js";
+import { registerConsole } from "./console.js";
 import type { ChannelServer, ServerRequest, ServerResponse, InboundMessage } from "./channels/types.js";
 
 interface Case {
@@ -327,6 +328,77 @@ async function voiceTests(): Promise<void> {
   check("voice: bad signature → 403", bad.status === 403);
 }
 
+async function consoleTests(): Promise<void> {
+  const store = path.join(os.tmpdir(), `casey-console-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
+  const queue = path.join(os.tmpdir(), `casey-console-q-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`);
+  const get = (p: string, query: Record<string, string> = {}): ServerRequest => ({ method: "GET", path: p, query, headers: {}, body: "" });
+  const post = (p: string, body: unknown): ServerRequest => ({ method: "POST", path: p, query: {}, headers: {}, body: JSON.stringify(body) });
+  try {
+    const a = newTicket({ channel: "web", conversationId: "web:a", from: "u@x.com", subject: "printer down", body: "the printer is dead" });
+    a.status = "resolved";
+    await saveTicket(store, a);
+    const b = newTicket({ channel: "web", conversationId: "web:b", from: "it@x.com", subject: "vpn outage", body: "vpn down for everyone" });
+    b.status = "escalated";
+    b.tier = 3;
+    b.triage = { category: "network", priority: "P1", tier: 3, summary: "site-wide vpn outage", missing_info: [], action: "escalate", client_reply: "on it", escalation_brief: "investigate the ASA headend" };
+    await saveTicket(store, b);
+
+    const server = new MockServer();
+    registerConsole(server, { ticketStore: store, arnieQueue: queue, darioUrl: undefined });
+
+    check(
+      "console: registers page + api routes",
+      server.routes.has("GET /console") && server.routes.has("GET /api/tickets") && server.routes.has("GET /api/ticket") &&
+        server.routes.has("GET /api/health") && server.routes.has("POST /api/ticket/close") &&
+        server.routes.has("POST /api/ticket/reopen") && server.routes.has("POST /api/ticket/redispatch") &&
+        server.routes.has("POST /api/ticket/reply"),
+    );
+
+    const page = await server.routes.get("GET /console")!(get("/console"));
+    check("console: serves HTML page", page.status === 200 && page.body.includes("Casey Console") && (page.headers?.["content-type"] || "").includes("text/html"));
+
+    const listRes = await server.routes.get("GET /api/tickets")!(get("/api/tickets"));
+    const list = JSON.parse(listRes.body) as { tickets: Array<{ id: string; status: string; tier: number | null; priority: string | null }> };
+    check("console: /api/tickets lists tickets", listRes.status === 200 && list.tickets.length === 2 && list.tickets.some((t) => t.id === b.id && t.tier === 3 && t.priority === "P1"), `len=${list.tickets.length}`);
+
+    const detRes = await server.routes.get("GET /api/ticket")!(get("/api/ticket", { id: b.id }));
+    const det = JSON.parse(detRes.body) as { ticket: { id: string; triage?: { escalation_brief?: string } }; arnie: { state: string } };
+    check("console: /api/ticket returns detail + arnie state", detRes.status === 200 && det.ticket.id === b.id && det.ticket.triage?.escalation_brief === "investigate the ASA headend" && det.arnie.state === "none", det.arnie?.state);
+
+    const missing = await server.routes.get("GET /api/ticket")!(get("/api/ticket"));
+    check("console: /api/ticket without id → 400", missing.status === 400);
+
+    const closed = await server.routes.get("POST /api/ticket/close")!(post("/api/ticket/close", { id: a.id }));
+    const afterClose = (await loadTickets(store)).find((t) => t.id === a.id);
+    check("console: close sets status closed", closed.status === 200 && afterClose?.status === "closed", afterClose?.status);
+
+    const reopened = await server.routes.get("POST /api/ticket/reopen")!(post("/api/ticket/reopen", { id: a.id }));
+    const afterReopen = (await loadTickets(store)).find((t) => t.id === a.id);
+    check("console: reopen sets an open status", reopened.status === 200 && afterReopen?.status === "awaiting_client", afterReopen?.status);
+
+    const redo = await server.routes.get("POST /api/ticket/redispatch")!(post("/api/ticket/redispatch", { id: b.id }));
+    const taskFile = path.join(queue, "inbox", b.id + ".task");
+    const taskBody = await fsp.readFile(taskFile, "utf8").catch(() => "");
+    check("console: redispatch writes the arnie task file", redo.status === 200 && taskBody.includes("investigate the ASA headend") && taskBody.includes(b.id), taskBody.slice(0, 40));
+
+    const rep = await server.routes.get("POST /api/ticket/reply")!(post("/api/ticket/reply", { id: a.id, text: "We pushed a fix, please retry." }));
+    const repBody = JSON.parse(rep.body) as { ok: boolean; delivered: boolean };
+    const afterReply = (await loadTickets(store)).find((t) => t.id === a.id);
+    const last = afterReply?.thread[afterReply.thread.length - 1];
+    check("console: reply appends a casey turn (web = record-only)", rep.status === 200 && repBody.ok === true && repBody.delivered === false && last?.role === "casey" && last?.text.includes("pushed a fix"), JSON.stringify({ role: last?.role }));
+
+    const emptyReply = await server.routes.get("POST /api/ticket/reply")!(post("/api/ticket/reply", { id: a.id, text: "   " }));
+    check("console: empty reply → 400", emptyReply.status === 400);
+
+    const healthRes = await server.routes.get("GET /api/health")!(get("/api/health"));
+    const h = JSON.parse(healthRes.body) as { casey: { state: string }; tickets: { total: number }; arnie: { state: string } };
+    check("console: /api/health reports casey up + counts", healthRes.status === 200 && h.casey.state === "up" && h.tickets.total === 2 && typeof h.arnie.state === "string", JSON.stringify({ total: h.tickets?.total }));
+  } finally {
+    await fsp.rm(store, { force: true }).catch(() => {});
+    await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function main(): Promise<void> {
   parseTests();
   schemaTests();
@@ -341,6 +413,7 @@ async function main(): Promise<void> {
   twilioCommonTests();
   await smsTests();
   await voiceTests();
+  await consoleTests();
 
   console.log("\n" + "=".repeat(60));
   console.log("CASEY TESTS");

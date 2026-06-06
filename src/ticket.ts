@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { TriageResult } from "./triage.js";
 
-export type TicketStatus = "new" | "resolved" | "awaiting_client" | "troubleshooting" | "escalated";
+export type TicketStatus = "new" | "resolved" | "awaiting_client" | "troubleshooting" | "escalated" | "closed";
 
 /** One turn of a ticket's conversation, oldest first. */
 export interface ThreadTurn {

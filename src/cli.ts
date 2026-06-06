@@ -18,6 +18,7 @@ import { TeamsChannel } from "./channels/teams.js";
 import { SmsChannel } from "./channels/sms.js";
 import { VoiceChannel } from "./channels/voice.js";
 import { HttpServer } from "./server.js";
+import { registerConsole } from "./console.js";
 import type { Channel, InboundMessage } from "./channels/types.js";
 
 const VERSION = "0.1.1";
@@ -54,6 +55,7 @@ const STATUS_LABEL: Record<TicketStatus, string> = {
   awaiting_client: chalk.yellow("AWAITING CLIENT (Tier-1)"),
   troubleshooting: chalk.yellow("TROUBLESHOOTING (Tier-2)"),
   escalated: chalk.red("ESCALATED → arnie (Tier-3)"),
+  closed: chalk.dim("CLOSED"),
 };
 
 function indent(s: string): string {
@@ -211,6 +213,28 @@ async function cmdServe(config: Config): Promise<void> {
   if (pushChannels.length) {
     server = new HttpServer();
     for (const ch of pushChannels) ch.register?.(server, (m) => handleInbound(deps, m));
+
+    // Operator console (single pane: User chat + Admin/Dev cockpit) on the same server.
+    const byName = new Map(channels.map((c) => [c.name, c]));
+    registerConsole(server, {
+      ticketStore: config.ticketStore,
+      arnieQueue: config.arnieQueue,
+      darioUrl: config.dario ? config.baseUrl ?? "http://localhost:3456" : config.baseUrl,
+      deliver: async (ticket, text) => {
+        const ch = byName.get(ticket.channel);
+        if (!ch) return;
+        await ch.reply({
+          channel: ticket.channel,
+          conversationId: ticket.conversationId,
+          to: ticket.from,
+          subject: ticket.subject,
+          text,
+          ref: ticket.ref,
+        });
+      },
+    });
+    console.log(chalk.dim(`  console: http://127.0.0.1:${config.port}/console (admin/dev + user)`));
+
     await server.start(config.port);
   }
 
