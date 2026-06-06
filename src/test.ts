@@ -332,6 +332,7 @@ async function consoleTests(): Promise<void> {
   const store = path.join(os.tmpdir(), `casey-console-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const queue = path.join(os.tmpdir(), `casey-console-q-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`);
   const cstore = path.join(os.tmpdir(), `casey-console-c-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
+  const pstore = path.join(os.tmpdir(), `casey-console-p-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.jsonl`);
   const get = (p: string, query: Record<string, string> = {}): ServerRequest => ({ method: "GET", path: p, query, headers: {}, body: "" });
   const post = (p: string, body: unknown): ServerRequest => ({ method: "POST", path: p, query: {}, headers: {}, body: JSON.stringify(body) });
   try {
@@ -345,7 +346,7 @@ async function consoleTests(): Promise<void> {
     await saveTicket(store, b);
 
     const server = new MockServer();
-    registerConsole(server, { ticketStore: store, clientStore: cstore, arnieQueue: queue, darioUrl: undefined });
+    registerConsole(server, { ticketStore: store, clientStore: cstore, projectStore: pstore, arnieQueue: queue, darioUrl: undefined });
 
     check(
       "console: registers page + api routes",
@@ -451,10 +452,34 @@ async function consoleTests(): Promise<void> {
     const listSla = JSON.parse((await server.routes.get("GET /api/tickets")!(get("/api/tickets"))).body) as { tickets: Array<{ id: string; sla?: { state: string } }> };
     const slaB = listSla.tickets.find((t) => t.id === b.id);
     check("console: tickets carry computed SLA state", !!slaB?.sla && typeof slaB.sla.state === "string", JSON.stringify({ sla: slaB?.sla?.state }));
+
+    check(
+      "console: registers project routes",
+      server.routes.has("GET /api/projects") && server.routes.has("GET /api/project") &&
+        server.routes.has("POST /api/projects") && server.routes.has("POST /api/project/update") &&
+        server.routes.has("POST /api/project/task"),
+    );
+    const pc = await server.routes.get("POST /api/projects")!(post("/api/projects", { name: "Acme onboarding", clientId }));
+    const pcBody = JSON.parse(pc.body) as { ok: boolean; project: { id: string; name: string; status: string } };
+    check("console: create project (starts in planning)", pc.status === 200 && pcBody.ok && pcBody.project.name === "Acme onboarding" && pcBody.project.status === "planning");
+    const projectId = pcBody.project.id;
+
+    const pt = await server.routes.get("POST /api/project/task")!(post("/api/project/task", { projectId, title: "Provision tenant" }));
+    const ptBody = JSON.parse(pt.body) as { project: { tasks: Array<{ id: string; title: string; status: string }> } };
+    check("console: add project task (todo)", pt.status === 200 && ptBody.project.tasks.length === 1 && ptBody.project.tasks[0].status === "todo", JSON.stringify({ n: ptBody.project.tasks.length }));
+    const taskId = ptBody.project.tasks[0].id;
+
+    const ptu = await server.routes.get("POST /api/project/task")!(post("/api/project/task", { projectId, taskId, status: "done", assignee: "sam" }));
+    const ptuBody = JSON.parse(ptu.body) as { project: { tasks: Array<{ status: string; assignee?: string }> } };
+    check("console: update project task status + assignee", ptu.status === 200 && ptuBody.project.tasks[0].status === "done" && ptuBody.project.tasks[0].assignee === "sam");
+
+    const pu = await server.routes.get("POST /api/project/update")!(post("/api/project/update", { id: projectId, status: "active" }));
+    check("console: update project status", pu.status === 200 && (JSON.parse(pu.body) as { project: { status: string } }).project.status === "active");
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
     await fsp.rm(cstore, { force: true }).catch(() => {});
+    await fsp.rm(pstore, { force: true }).catch(() => {});
   }
 }
 

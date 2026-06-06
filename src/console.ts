@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { loadTickets, saveTicket, addTurn, type Ticket } from "./ticket.js";
 import { loadClients, saveClient, newClient, newAsset, type Client } from "./clients.js";
+import { loadProjects, saveProject, newProject, newTask, type Project, type ProjectStatus, type TaskStatus } from "./projects.js";
 import type { ChannelServer, ServerRequest, ServerResponse } from "./channels/types.js";
 
 /**
@@ -17,6 +18,8 @@ export interface ConsoleCtx {
   ticketStore: string;
   /** Client + asset registry (JSONL). */
   clientStore: string;
+  /** Project work-item store (JSONL). */
+  projectStore: string;
   /** arnie hand-off queue root (tasks live in <queue>/inbox, outcomes alongside). */
   arnieQueue?: string;
   /** dario / LLM base URL, probed for the health panel. */
@@ -330,6 +333,62 @@ async function addClientAsset(ctx: ConsoleCtx, req: ServerRequest): Promise<Serv
   return json(200, { ok: true, asset: a, client: c });
 }
 
+// ---- Project board (human-run; ticketing + management only) ----
+async function findProject(ctx: ConsoleCtx, id: string): Promise<Project | undefined> {
+  return (await loadProjects(ctx.projectStore)).find((p) => p.id === id);
+}
+
+async function createProject(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const name = String(body.name ?? "").trim();
+  if (!name) return json(400, { error: "missing name" });
+  const clientId = body.clientId != null ? String(body.clientId) || undefined : undefined;
+  const dueDate = body.dueDate != null ? String(body.dueDate) || undefined : undefined;
+  const p = newProject(name, clientId, dueDate);
+  await saveProject(ctx.projectStore, p);
+  return json(200, { ok: true, project: p });
+}
+
+async function updateProject(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const id = String(body.id ?? "");
+  if (!id) return json(400, { error: "missing id" });
+  const p = await findProject(ctx, id);
+  if (!p) return json(404, { error: "not found" });
+  if (body.name != null) p.name = String(body.name);
+  if (body.status != null) p.status = String(body.status) as ProjectStatus;
+  if (body.clientId !== undefined) p.clientId = body.clientId ? String(body.clientId) : undefined;
+  if (body.dueDate !== undefined) p.dueDate = body.dueDate ? String(body.dueDate) : undefined;
+  p.updated_at = new Date().toISOString();
+  await saveProject(ctx.projectStore, p);
+  return json(200, { ok: true, project: p });
+}
+
+/** Add a task (title given) or update one (taskId given): status / assignee / title. */
+async function projectTask(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  const body = parseBody(req);
+  const projectId = String(body.projectId ?? "");
+  if (!projectId) return json(400, { error: "missing projectId" });
+  const p = await findProject(ctx, projectId);
+  if (!p) return json(404, { error: "not found" });
+  p.tasks = p.tasks || [];
+  const taskId = body.taskId != null ? String(body.taskId) : "";
+  if (taskId) {
+    const t = p.tasks.find((x) => x.id === taskId);
+    if (!t) return json(404, { error: "task not found" });
+    if (body.title != null) t.title = String(body.title);
+    if (body.status != null) t.status = String(body.status) as TaskStatus;
+    if (body.assignee !== undefined) t.assignee = body.assignee ? String(body.assignee) : undefined;
+  } else {
+    const title = String(body.title ?? "").trim();
+    if (!title) return json(400, { error: "missing title" });
+    p.tasks.push(newTask(title));
+  }
+  p.updated_at = new Date().toISOString();
+  await saveProject(ctx.projectStore, p);
+  return json(200, { ok: true, project: p });
+}
+
 interface ActivityEvent {
   at: string;
   actor: string;
@@ -422,6 +481,17 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/client/asset", (req) => addClientAsset(ctx, req));
   server.route("POST", "/api/ticket/client", (req) => setTicketClient(ctx, req));
   server.route("POST", "/api/ticket/assign", (req) => assignTicket(ctx, req));
+  server.route("GET", "/api/projects", async () => json(200, { projects: await loadProjects(ctx.projectStore) }));
+  server.route("GET", "/api/project", async (req) => {
+    const id = req.query.id;
+    if (!id) return json(400, { error: "missing id" });
+    const p = await findProject(ctx, id);
+    if (!p) return json(404, { error: "not found" });
+    return json(200, { project: p });
+  });
+  server.route("POST", "/api/projects", (req) => createProject(ctx, req));
+  server.route("POST", "/api/project/update", (req) => updateProject(ctx, req));
+  server.route("POST", "/api/project/task", (req) => projectTask(ctx, req));
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +604,10 @@ export const CONSOLE_HTML = `<!doctype html>
   .sla-at_risk { color:var(--amber); border-color:#3f3315; }
   .sla-met { color:var(--green); border-color:#1f3b29; }
   .sla-ok { color:var(--dim); }
+  /* projects */
+  .proj-active { color:var(--green); } .proj-planning { color:var(--dim); } .proj-on_hold { color:var(--amber); } .proj-done { color:var(--dim); }
+  .task-todo { color:var(--dim); } .task-doing { color:var(--amber); } .task-done { color:var(--green); }
+  .pinput { flex:1; background:#0f1115; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:9px 12px; font:inherit; }
   /* User view: chat */
   #user { height:100%; display:flex; align-items:center; justify-content:center; }
   .chat { width:min(560px,94vw); height:min(720px,94%); background:var(--panel); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--line); }
@@ -593,7 +667,7 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [] };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null };
 
   function preserveScroll(node, fn) {
     var top = node ? node.scrollTop : 0;
@@ -651,7 +725,7 @@ export const CONSOLE_HTML = `<!doctype html>
     { id:"backup", label:"Backup", live:false, phase:3, blurb:"Backup-failure queue + restore approvals. Needs alert intake + the asset model." },
     { id:"bench", label:"Bench", live:false, phase:3, blurb:"Device-prep / imaging / RMA queue. Needs the asset model + procurement handoff." },
     { id:"procurement", label:"Procurement", live:false, phase:3, blurb:"Purchase orders + vendor management; hands off to Bench." },
-    { id:"project", label:"Project", live:false, phase:4, blurb:"Project board — phases, tasks, assignment, time. Human-run (no AI execution yet)." },
+    { id:"project", label:"Project", live:true, board:"project", blurb:"Project board — onboardings, migrations, rollouts. Human-run: tasks, status, assignment (no AI execution yet)." },
     { id:"sales", label:"Sales", live:false, phase:5, blurb:"Pipeline + leads; casey splits intake-vs-lead at the front door." },
     { id:"am", label:"Account Manager", live:false, phase:5, blurb:"Client book, health, QBR reporting. Needs the client model." },
     { id:"accounting", label:"Accounting / HR", live:false, phase:5, blurb:"Billable time to invoice; contract usage. Needs time tracking." },
@@ -686,6 +760,7 @@ export const CONSOLE_HTML = `<!doctype html>
       renderKpi();
       return;
     }
+    if (r.board === "project") { showProjectBoard(); return; }
     state.filter = r.filter || "all";
     var fsel = document.getElementById("filter"); if (fsel) fsel.value = state.filter;
     renderList();
@@ -707,6 +782,7 @@ export const CONSOLE_HTML = `<!doctype html>
     return t.status === f;
   }
   function renderList() {
+    if (activeRole().board === "project") return; // project board renders its own list
     var list = document.getElementById("list");
     if (!activeRole().live) { list.innerHTML = ""; list.appendChild(el("div", "row", "— view not wired yet —")); return; }
     preserveScroll(list, function() {
@@ -779,6 +855,7 @@ export const CONSOLE_HTML = `<!doctype html>
   }
 
   function renderKpi() {
+    if (activeRole().board === "project") return; // project board renders its own KPIs
     var k = document.getElementById("kpi");
     if (!k) return;
     var ts = state.tickets;
@@ -852,6 +929,111 @@ export const CONSOLE_HTML = `<!doctype html>
     var m = Math.abs(s.dueMs);
     var txt = m < 3600000 ? (Math.round(m/60000) + "m") : (m < 86400000 ? (Math.round(m/3600000) + "h") : (Math.round(m/86400000) + "d"));
     return s.state === "breached" ? ("SLA overdue " + txt) : ("SLA " + txt + " left");
+  }
+
+  // ---- project board (human-run; ticketing + management only) ----
+  async function loadProjectsList() {
+    try { var r = await fetch("/api/projects"); var d = await r.json(); state.projects = d.projects || []; } catch (e) { /* transient */ }
+  }
+  function projChip(s) { return el("span", "chip proj-" + s, s); }
+  function showProjectBoard() {
+    renderProjectList();
+    renderProjectKpi();
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    d.appendChild(el("div", "rolenote", activeRole().blurb || ""));
+    d.appendChild(el("div", "empty", "Select a project, or + New project in the list."));
+    loadProjectsList().then(function(){ renderProjectList(); renderProjectKpi(); });
+  }
+  function renderProjectList() {
+    var list = document.getElementById("list");
+    preserveScroll(list, function(){
+      list.innerHTML = "";
+      var head = el("div", "row");
+      var nb = el("button", "btn primary", "+ New project");
+      nb.onclick = createProjectPrompt;
+      head.appendChild(nb);
+      list.appendChild(head);
+      if (!state.projects.length) { list.appendChild(el("div", "row", "No projects yet.")); return; }
+      state.projects.forEach(function(p){
+        var row = el("div", "row" + (p.id === state.selectedProject ? " sel" : ""));
+        row.appendChild(el("div", "subj", p.name));
+        var sub = el("div", "sub");
+        sub.appendChild(projChip(p.status));
+        var tasks = p.tasks || [];
+        var done = tasks.filter(function(t){ return t.status === "done"; }).length;
+        sub.appendChild(el("span", null, done + "/" + tasks.length + " tasks"));
+        var cn = p.clientId ? clientName(p.clientId) : null; if (cn) sub.appendChild(el("span", "chip", cn));
+        row.appendChild(sub);
+        row.onclick = function(){ selectProject(p.id); };
+        list.appendChild(row);
+      });
+    });
+  }
+  async function createProjectPrompt() {
+    var nm = prompt("New project name:"); if (!nm) return;
+    var r = await fetch("/api/projects", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ name: nm }) });
+    var d = await r.json(); await loadProjectsList(); renderProjectList(); renderProjectKpi(); if (d.project) selectProject(d.project.id);
+  }
+  async function selectProject(id) {
+    state.selectedProject = id; renderProjectList();
+    try { var r = await fetch("/api/project?id=" + encodeURIComponent(id)); if (!r.ok) return; var d = await r.json(); renderProjectDetail(d.project); } catch (e) { /* transient */ }
+  }
+  async function projTask(body) {
+    await fetch("/api/project/task", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
+    await loadProjectsList(); renderProjectList(); renderProjectKpi(); selectProject(body.projectId);
+  }
+  function renderProjectDetail(p) {
+    var d = document.getElementById("detail"); d.innerHTML = "";
+    var dh = el("div", "dh"); dh.appendChild(el("h2", null, p.name)); dh.appendChild(projChip(p.status)); d.appendChild(dh);
+    var cn = p.clientId ? (clientName(p.clientId) || p.clientId) : null;
+    d.appendChild(el("div", "meta", p.id + (cn ? (" · " + cn) : "") + (p.dueDate ? (" · due " + p.dueDate) : "") + " · updated " + ago(p.updated_at)));
+    d.appendChild(el("div", "sec", "Status"));
+    var srow = el("div", "actions");
+    ["planning","active","on_hold","done"].forEach(function(s){
+      var b = el("button", "btn" + (p.status === s ? " primary" : ""), s);
+      b.onclick = async function(){ await fetch("/api/project/update", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ id: p.id, status: s }) }); await loadProjectsList(); renderProjectList(); renderProjectKpi(); selectProject(p.id); };
+      srow.appendChild(b);
+    });
+    d.appendChild(srow);
+    var tasks = p.tasks || [];
+    var done = tasks.filter(function(t){ return t.status === "done"; }).length;
+    d.appendChild(el("div", "sec", "Tasks (" + done + "/" + tasks.length + ")"));
+    var tl = el("div", "thread");
+    tasks.forEach(function(t){
+      var row = el("div", "card");
+      var line = el("div", "actions");
+      var cyc = el("button", "btn task-" + t.status, t.status);
+      cyc.onclick = function(){ var nx = t.status === "todo" ? "doing" : (t.status === "doing" ? "done" : "todo"); projTask({ projectId: p.id, taskId: t.id, status: nx }); };
+      line.appendChild(cyc);
+      line.appendChild(el("span", "ex", t.title + (t.assignee ? ("  · @" + t.assignee) : "")));
+      var asg = el("button", "btn", "assign");
+      asg.onclick = function(){ var who = prompt("Assign task to:", t.assignee || ""); if (who === null) return; projTask({ projectId: p.id, taskId: t.id, assignee: who }); };
+      line.appendChild(asg);
+      row.appendChild(line);
+      tl.appendChild(row);
+    });
+    d.appendChild(tl);
+    var addRow = el("div", "replybox");
+    var inp = document.createElement("input"); inp.type = "text"; inp.placeholder = "New task…"; inp.className = "pinput";
+    var ab = el("button", "btn primary", "Add task");
+    ab.onclick = function(){ var v = inp.value.trim(); if (!v) return; inp.value = ""; projTask({ projectId: p.id, title: v }); };
+    addRow.appendChild(inp); addRow.appendChild(ab);
+    d.appendChild(addRow);
+  }
+  function renderProjectKpi() {
+    var k = document.getElementById("kpi"); if (!k) return;
+    var ps = state.projects;
+    var active = ps.filter(function(p){ return p.status === "active"; }).length;
+    var planning = ps.filter(function(p){ return p.status === "planning"; }).length;
+    var allTasks = 0, doneTasks = 0, doing = 0;
+    ps.forEach(function(p){ (p.tasks || []).forEach(function(t){ allTasks++; if (t.status === "done") doneTasks++; if (t.status === "doing") doing++; }); });
+    k.innerHTML = "";
+    function card(n, label, cls) { var c = el("div", "k"); c.appendChild(el("div", "n" + (cls ? " " + cls : ""), String(n))); c.appendChild(el("div", "l", label)); return c; }
+    k.appendChild(card(ps.length, "projects"));
+    k.appendChild(card(active, "active", active ? "good" : ""));
+    k.appendChild(card(planning, "planning"));
+    k.appendChild(card(doing, "tasks doing", doing ? "warn" : ""));
+    k.appendChild(card(doneTasks + " / " + allTasks, "tasks done", "good"));
   }
 
   // ---- admin: detail ----
@@ -1189,9 +1371,11 @@ export const CONSOLE_HTML = `<!doctype html>
   loadHealth();
   setInterval(function(){
     if (state.view !== "admin") return;
+    var r = activeRole();
+    if (!r.live) return;
+    if (r.board === "project") { loadProjectsList().then(function(){ renderProjectList(); renderProjectKpi(); }); return; }
     loadTickets(true);
     loadHealth();
-    if (!activeRole().live) return;
     if (state.selected) selectTicket(state.selected);   // change-detected + scroll-preserving
     else loadActivity();
   }, 5000);
