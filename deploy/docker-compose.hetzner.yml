@@ -1,0 +1,62 @@
+# casey + arnie on the Hetzner box, reusing the existing dario (Claude Max proxy)
+# on the shared askalf network. casey is fronted by the casey-console Cloudflare
+# Tunnel (CF Access Email-OTP); arnie drains the Tier-3 queue. Bring up via
+# deploy/deploy-casey-hetzner.sh (it clones casey + arnie as siblings and builds).
+#
+# Requires (from --env-file /root/.askalf/.env):
+#   DARIO_API_KEY        - the key the existing dario expects (casey/arnie auth to it)
+#   CASEY_TUNNEL_TOKEN   - the casey-console connector token (from the dev box's
+#                          casey-live/.cf-tunnel-token)
+
+services:
+  casey:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: askalf/casey:local
+    container_name: casey
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${DARIO_API_KEY}
+      ANTHROPIC_BASE_URL: http://dario:3456 # reuse the dario already on this network
+    # --trust-access-header: trust CF Access identity (we're behind the tunnel + Access).
+    command: ["serve", "--web", "--port", "8787", "--arnie-queue", "/root/.casey/queue", "--trust-access-header"]
+    volumes:
+      - /root/.askalf/casey-data:/root/.casey # tickets/clients/projects/graduations/roles.json + the queue
+    networks: [askalf-net]
+
+  arnie:
+    build:
+      context: ../../arnie
+      dockerfile: Dockerfile
+    image: askalf/arnie:local
+    container_name: casey-arnie
+    restart: unless-stopped
+    environment:
+      ANTHROPIC_API_KEY: ${DARIO_API_KEY}
+      ANTHROPIC_BASE_URL: http://dario:3456
+    # Tier-3 worker, green ceiling. execute-on-approval is intentionally NOT enabled
+    # (no --execute-approvals) — and a cloud box has no path to client LANs anyway.
+    command: ["--serve", "/root/.casey/queue/inbox", "--autonomous", "--autonomy-ceiling", "green",
+              "--audit-dir", "/root/.casey/arnie-audit", "--report-dir", "/root/.casey/arnie-reports",
+              "--kb-dir", "/root/.casey/arnie-kb"]
+    volumes:
+      - /root/.askalf/casey-data:/root/.casey # shares the queue + artifacts with casey
+    networks: [askalf-net]
+
+  cloudflared-casey:
+    image: cloudflare/cloudflared:latest
+    container_name: casey-cloudflared
+    restart: unless-stopped
+    # Share casey's network namespace so the tunnel's ingress (127.0.0.1:8787)
+    # reaches casey directly — no host port, no ingress reconfig needed.
+    network_mode: "service:casey"
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CASEY_TUNNEL_TOKEN}
+    depends_on: [casey]
+
+networks:
+  askalf-net:
+    external: true
+    name: askalf_askalf-net
