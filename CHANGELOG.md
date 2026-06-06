@@ -17,6 +17,7 @@ rename that heading to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh
   - Adds a `closed` ticket status.
   - **KPI strip** (open / P1 open / today / in-flight escalations / open-by-tier / resolved-closed), a **live activity feed** as the default detail view (intake → triage → escalate → Arnie-done, reconstructed from the append-only ticket log + Arnie outcomes via `/api/activity`), and **instant search** over the ticket list.
   - Auto-refresh is change-detected and scroll-preserving — it re-renders only when data actually changed and keeps your scroll position, so reading a long thread/report is no longer interrupted.
+  - **Role-scoped views** — a role switcher re-skins the single pane per team (no auth yet; the seed of the MSP-platform direction). Live roles scope the list + gate actions + carry a context blurb: **Owner** (oversight), **Service Desk/CSR** (intake+triage, open queue), **Dispatch** (all open, priority-sorted), **T3/Approver** (Arnie escalations), **Security** (security-classed). Planned roles (Backup, Bench, Procurement, Project, Sales, Account Manager, Accounting/HR, Dev) show a labeled placeholder with the phase they arrive in. Selection persists in localStorage.
 
 ## [0.1.1] - 2026-06-05
 
