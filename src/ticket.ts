@@ -39,6 +39,8 @@ export interface Ticket {
   assetId?: string;
   /** Staff member this ticket is assigned to (free-text until identity lands). */
   assignee?: string;
+  /** Billable time logged against this ticket. */
+  timeEntries?: { id: string; minutes: number; by?: string; note?: string; at: string }[];
 }
 
 /** A bare inbound ticket — the minimum to triage. */

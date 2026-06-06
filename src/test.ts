@@ -356,7 +356,8 @@ async function consoleTests(): Promise<void> {
         server.routes.has("POST /api/ticket/reply") && server.routes.has("POST /api/ticket/approve") &&
         server.routes.has("POST /api/ticket/reject") && server.routes.has("GET /api/clients") &&
         server.routes.has("POST /api/clients") && server.routes.has("POST /api/client/asset") &&
-        server.routes.has("POST /api/ticket/client") && server.routes.has("POST /api/ticket/assign"),
+        server.routes.has("POST /api/ticket/client") && server.routes.has("POST /api/ticket/assign") &&
+        server.routes.has("POST /api/ticket/time"),
     );
 
     const page = await server.routes.get("GET /console")!(get("/console"));
@@ -475,6 +476,15 @@ async function consoleTests(): Promise<void> {
 
     const pu = await server.routes.get("POST /api/project/update")!(post("/api/project/update", { id: projectId, status: "active" }));
     check("console: update project status", pu.status === 200 && (JSON.parse(pu.body) as { project: { status: string } }).project.status === "active");
+
+    const tm1 = await server.routes.get("POST /api/ticket/time")!(post("/api/ticket/time", { id: a.id, minutes: 30, note: "triage" }));
+    const tm2 = await server.routes.get("POST /api/ticket/time")!(post("/api/ticket/time", { id: a.id, minutes: 45 }));
+    const tmBody = JSON.parse(tm2.body) as { ok: boolean; totalMinutes: number };
+    check("console: log time accumulates", tm1.status === 200 && tm2.status === 200 && tmBody.ok && tmBody.totalMinutes === 75, JSON.stringify({ total: tmBody.totalMinutes }));
+    const tmBad = await server.routes.get("POST /api/ticket/time")!(post("/api/ticket/time", { id: a.id, minutes: 0 }));
+    check("console: log time rejects non-positive minutes → 400", tmBad.status === 400);
+    const listMin = JSON.parse((await server.routes.get("GET /api/tickets")!(get("/api/tickets"))).body) as { tickets: Array<{ id: string; minutes?: number }> };
+    check("console: ticket summary carries total minutes", (listMin.tickets.find((t) => t.id === a.id)?.minutes) === 75);
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
