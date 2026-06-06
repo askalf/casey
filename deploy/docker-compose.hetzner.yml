@@ -20,7 +20,7 @@ services:
       ANTHROPIC_API_KEY: ${DARIO_API_KEY}
       ANTHROPIC_BASE_URL: http://dario:3456 # reuse the dario already on this network
     # --trust-access-header: trust CF Access identity (we're behind the tunnel + Access).
-    command: ["serve", "--web", "--port", "8787", "--arnie-queue", "/root/.casey/queue", "--trust-access-header"]
+    command: ["serve", "--web", "--port", "8787", "--arnie-queue", "/root/.casey/queue", "--trust-access-header", "--base-url", "http://dario:3456"]
     volumes:
       - /root/.askalf/casey-data:/root/.casey # tickets/clients/projects/graduations/roles.json + the queue
     networks: [askalf-net]
@@ -38,6 +38,7 @@ services:
     # Tier-3 worker, green ceiling. execute-on-approval is intentionally NOT enabled
     # (no --execute-approvals) — and a cloud box has no path to client LANs anyway.
     command: ["--serve", "/root/.casey/queue/inbox", "--autonomous", "--autonomy-ceiling", "green",
+              "--base-url", "http://dario:3456",
               "--audit-dir", "/root/.casey/arnie-audit", "--report-dir", "/root/.casey/arnie-reports",
               "--kb-dir", "/root/.casey/arnie-kb"]
     volumes:
