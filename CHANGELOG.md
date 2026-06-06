@@ -10,6 +10,14 @@ rename that heading to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh
 
 ## [Unreleased]
 
+- **Operator console** — a single-pane web UI at `/console` (served by `casey serve --web`, loopback). Two views toggled in one pane:
+  - **User** — the live client chat, running through Casey's real triage → troubleshoot → escalate pipeline.
+  - **Admin / Dev** — a sidebar-and-detail cockpit: every ticket with its full thread, triage, and Arnie's Tier-3 outcome + report rendered inline; stack-health panel (casey / arnie / dario, with Arnie liveness derived from the escalation backlog) and ticket counts.
+  - **Full control** — close / reopen a ticket, re-dispatch a stuck escalation to Arnie, and reply into a thread as Casey (delivered for push channels; record-only for synchronous web/webhook). Backed by a small JSON API (`/api/tickets`, `/api/ticket`, `/api/health`, `/api/ticket/{close,reopen,redispatch,reply}`) reading the existing `tickets.jsonl` + Arnie queue artifacts — no new datastore.
+  - Adds a `closed` ticket status.
+  - **KPI strip** (open / P1 open / today / in-flight escalations / open-by-tier / resolved-closed), a **live activity feed** as the default detail view (intake → triage → escalate → Arnie-done, reconstructed from the append-only ticket log + Arnie outcomes via `/api/activity`), and **instant search** over the ticket list.
+  - Auto-refresh is change-detected and scroll-preserving — it re-renders only when data actually changed and keeps your scroll position, so reading a long thread/report is no longer interrupted.
+
 ## [0.1.1] - 2026-06-05
 
 First npm release — an omnichannel AI IT service desk (Tier-1 triage + Tier-2 guided troubleshooting), pairing with arnie (Tier-3).
