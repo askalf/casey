@@ -215,6 +215,62 @@ async function reply(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerRespons
   return json(200, { ok: true, delivered, note, ticket: summarize(t) });
 }
 
+interface ActivityEvent {
+  at: string;
+  actor: string;
+  kind: "new" | "status" | "turn" | "arnie";
+  ticketId: string;
+  subject?: string;
+  status?: string;
+  tier?: number | null;
+  role?: string;
+}
+
+/**
+ * Reconstruct a recent event timeline. tickets.jsonl is append-only — each save
+ * is a fresh snapshot — so diffing consecutive snapshots of the same ticket
+ * yields its transitions (intake, status changes, client replies). Arnie's
+ * finished outcomes are merged in. Newest first, capped.
+ */
+async function activity(ctx: ConsoleCtx): Promise<ActivityEvent[]> {
+  const raw = await fsp.readFile(ctx.ticketStore, "utf8").catch(() => "");
+  const prev = new Map<string, Ticket>();
+  const events: ActivityEvent[] = [];
+  for (const line of raw.split("\n").filter(Boolean)) {
+    let t: Ticket;
+    try {
+      t = JSON.parse(line) as Ticket;
+    } catch {
+      continue;
+    }
+    const p = prev.get(t.id);
+    if (!p) events.push({ at: t.created_at, actor: "client", kind: "new", ticketId: t.id, subject: t.subject });
+    if (t.status !== "new" && (!p || p.status !== t.status)) {
+      events.push({ at: t.updated_at, actor: "casey", kind: "status", status: t.status, tier: t.tier ?? t.triage?.tier ?? null, ticketId: t.id, subject: t.subject });
+    }
+    const grew = (t.thread?.length ?? 0) > (p?.thread?.length ?? 0);
+    if (p && grew) {
+      const last = t.thread[t.thread.length - 1];
+      // casey's own moves already show as status events; surface client comebacks.
+      if (last.role === "client") events.push({ at: last.at, actor: "client", kind: "turn", role: "client", ticketId: t.id, subject: t.subject });
+    }
+    prev.set(t.id, t);
+  }
+  if (ctx.arnieQueue) {
+    const inbox = path.join(ctx.arnieQueue, "inbox");
+    const entries = await fsp.readdir(inbox).catch(() => [] as string[]);
+    for (const f of entries.filter((e) => e.endsWith(".outcome.json"))) {
+      const oc = await readJson<ArnieOutcome>(path.join(inbox, f));
+      if (oc?.finished_at) {
+        const id = f.slice(0, -".outcome.json".length);
+        events.push({ at: oc.finished_at, actor: "arnie", kind: "arnie", status: oc.status, ticketId: id, subject: prev.get(id)?.subject });
+      }
+    }
+  }
+  events.sort((a, b) => (b.at || "").localeCompare(a.at || ""));
+  return events.slice(0, 60);
+}
+
 /** Register the console page + its JSON API on the shared HTTP server. */
 export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("GET", "/console", async () => ({
@@ -238,6 +294,7 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   });
 
   server.route("GET", "/api/health", async () => json(200, await health(ctx)));
+  server.route("GET", "/api/activity", async () => json(200, { events: await activity(ctx) }));
 
   server.route("POST", "/api/ticket/close", (req) => mutateStatus(ctx, req, "closed"));
   server.route("POST", "/api/ticket/reopen", (req) => mutateStatus(ctx, req, "awaiting_client"));
@@ -278,8 +335,17 @@ export const CONSOLE_HTML = `<!doctype html>
   .dot.down, .dot.stalled { background:var(--red); }
   main { flex:1; min-height:0; }
 
-  /* Admin view: sidebar + detail */
-  #admin { display:flex; height:100%; }
+  /* Admin view: KPI strip over (sidebar + detail) */
+  #admin { display:flex; flex-direction:column; height:100%; }
+  .adminbody { display:flex; flex:1; min-height:0; }
+  .kpi { display:flex; gap:8px; flex-wrap:wrap; padding:9px 12px; border-bottom:1px solid var(--line); background:#10131a; }
+  .kpi .k { display:flex; flex-direction:column; gap:3px; padding:5px 14px; border-right:1px solid var(--line); }
+  .kpi .k:last-child { border-right:0; }
+  .kpi .n { font-size:19px; font-weight:700; line-height:1; }
+  .kpi .n.warn { color:var(--amber); } .kpi .n.bad { color:var(--red); } .kpi .n.good { color:var(--green); }
+  .kpi .l { font-size:10.5px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; white-space:nowrap; }
+  .kpi .bars { display:flex; gap:5px; }
+  .kpi .bars .b { font-size:12px; padding:0 7px; border-radius:20px; background:var(--chip); border:1px solid var(--line); }
   .side { width:330px; min-width:300px; border-right:1px solid var(--line); display:flex; flex-direction:column; background:var(--panel2); }
   .side .hd { padding:10px 12px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
   select, .btn { background:var(--chip); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
@@ -322,6 +388,18 @@ export const CONSOLE_HTML = `<!doctype html>
            padding:9px 16px; border-radius:9px; color:var(--text); opacity:0; transition:opacity .2s; pointer-events:none; max-width:80vw; }
   .toast.show { opacity:1; }
 
+  /* search */
+  #search { width:100%; background:#0f1115; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font:inherit; }
+  /* activity feed */
+  .feed { display:flex; flex-direction:column; }
+  .feed .ev { display:flex; gap:10px; align-items:baseline; padding:7px 6px; border-bottom:1px solid #1a1e27; cursor:pointer; border-radius:6px; }
+  .feed .ev:hover { background:#1b1f28; }
+  .feed .et { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; min-width:64px; }
+  .feed .ei { width:16px; text-align:center; }
+  .feed .ex { flex:1; min-width:0; }
+  .feed .ex .es { color:var(--dim); }
+  .backbtn { cursor:pointer; color:var(--me); font-size:13px; margin-bottom:8px; display:inline-block; }
+  .backbtn:hover { text-decoration:underline; }
   /* User view: chat */
   #user { height:100%; display:flex; align-items:center; justify-content:center; }
   .chat { width:min(560px,94vw); height:min(720px,94%); background:var(--panel); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--line); }
@@ -346,21 +424,26 @@ export const CONSOLE_HTML = `<!doctype html>
   </header>
   <main>
     <div id="admin">
-      <div class="side">
-        <div class="hd">
-          <select id="filter">
-            <option value="all">All tickets</option>
-            <option value="open">Open</option>
-            <option value="escalated">Escalated</option>
-            <option value="resolved">Resolved</option>
-            <option value="closed">Closed</option>
-          </select>
-          <button class="btn" id="refresh">Refresh</button>
+      <div class="kpi" id="kpi"></div>
+      <div class="adminbody">
+        <div class="side">
+          <div class="hd"><input id="search" type="text" placeholder="Search tickets…" autocomplete="off" /></div>
+          <div class="hd">
+            <select id="filter">
+              <option value="all">All tickets</option>
+              <option value="open">Open</option>
+              <option value="escalated">Escalated</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+            </select>
+            <button class="btn" id="refresh">Refresh</button>
+            <button class="btn" id="showfeed">Activity</button>
+          </div>
+          <div id="list"></div>
+          <div class="health" id="healthPanel"></div>
         </div>
-        <div id="list"></div>
-        <div class="health" id="healthPanel"></div>
+        <div class="detail" id="detail"></div>
       </div>
-      <div class="detail" id="detail"><div class="empty">Select a ticket to inspect its thread, triage, and Arnie outcome.</div></div>
     </div>
     <div id="user" style="display:none">
       <div class="chat">
@@ -375,8 +458,13 @@ export const CONSOLE_HTML = `<!doctype html>
   </main>
   <div class="toast" id="toast"></div>
 <script>
-  var state = { tickets: [], selected: null, filter: "all", view: "admin" };
+  var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null };
 
+  function preserveScroll(node, fn) {
+    var top = node ? node.scrollTop : 0;
+    fn();
+    if (node) node.scrollTop = top;
+  }
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -413,30 +501,37 @@ export const CONSOLE_HTML = `<!doctype html>
   document.getElementById("tab-user").onclick = function(){ setView("user"); };
 
   // ---- admin: list + health ----
+  function matchesSearch(t) {
+    var q = state.search.trim().toLowerCase();
+    if (!q) return true;
+    return [t.subject, t.from, t.id, t.category, t.priority, t.status].some(function(v){ return v && String(v).toLowerCase().indexOf(q) >= 0; });
+  }
   function passesFilter(t) {
+    if (!matchesSearch(t)) return false;
     var f = state.filter;
     if (f === "all") return true;
-    if (f === "open") return ["new","awaiting_client","troubleshooting"].indexOf(t.status) >= 0;
+    if (f === "open") return ["new","awaiting_client","troubleshooting","escalated"].indexOf(t.status) >= 0;
     return t.status === f;
   }
   function renderList() {
     var list = document.getElementById("list");
-    list.innerHTML = "";
-    var shown = state.tickets.filter(passesFilter);
-    if (!shown.length) { list.appendChild(el("div", "row", "No tickets.")); return; }
-    shown.forEach(function(t) {
-      var row = el("div", "row" + (t.id === state.selected ? " sel" : ""));
-      row.appendChild(el("div", "subj", t.subject || "(no subject)"));
-      var sub = el("div", "sub");
-      sub.appendChild(tierChip(t.tier));
-      if (t.priority) sub.appendChild(el("span", "chip", t.priority));
-      sub.appendChild(el("span", "st-" + t.status, t.status));
-      sub.appendChild(el("span", null, "· " + (t.from || "")));
-      row.appendChild(sub);
-      var meta = el("div", "sub", ago(t.updated_at) + " · " + (t.channel || ""));
-      row.appendChild(meta);
-      row.onclick = function(){ selectTicket(t.id); };
-      list.appendChild(row);
+    preserveScroll(list, function() {
+      list.innerHTML = "";
+      var shown = state.tickets.filter(passesFilter);
+      if (!shown.length) { list.appendChild(el("div", "row", "No tickets match.")); return; }
+      shown.forEach(function(t) {
+        var row = el("div", "row" + (t.id === state.selected ? " sel" : ""));
+        row.appendChild(el("div", "subj", t.subject || "(no subject)"));
+        var sub = el("div", "sub");
+        sub.appendChild(tierChip(t.tier));
+        if (t.priority) sub.appendChild(el("span", "chip", t.priority));
+        sub.appendChild(el("span", "st-" + t.status, t.status));
+        sub.appendChild(el("span", null, "· " + (t.from || "")));
+        row.appendChild(sub);
+        row.appendChild(el("div", "sub", ago(t.updated_at) + " · " + (t.channel || "")));
+        row.onclick = function(){ selectTicket(t.id); };
+        list.appendChild(row);
+      });
     });
   }
   function setDot(id, st) {
@@ -444,6 +539,7 @@ export const CONSOLE_HTML = `<!doctype html>
     d.className = "dot" + (st ? " " + st : "");
   }
   function renderHealth(h) {
+    state.health = h;
     setDot("d-casey", h.casey ? h.casey.state : "");
     setDot("d-arnie", h.arnie ? h.arnie.state : "");
     setDot("d-dario", h.dario ? h.dario.state : "");
@@ -468,6 +564,43 @@ export const CONSOLE_HTML = `<!doctype html>
       p.appendChild(el("div", "hrow", t.total + " tickets · " + t.today + " today"));
       if (parts.length) p.appendChild(el("div", "hrow", parts.join("  ")));
     }
+    renderKpi();
+  }
+
+  function renderKpi() {
+    var k = document.getElementById("kpi");
+    if (!k) return;
+    var ts = state.tickets;
+    var openS = ["new","awaiting_client","troubleshooting","escalated"];
+    var open = ts.filter(function(t){ return openS.indexOf(t.status) >= 0; });
+    var p1 = open.filter(function(t){ return t.priority === "P1"; });
+    var todayStr = new Date().toISOString().slice(0,10);
+    var today = ts.filter(function(t){ return (t.created_at||"").slice(0,10) === todayStr; });
+    var resolved = ts.filter(function(t){ return t.status === "resolved"; }).length;
+    var closed = ts.filter(function(t){ return t.status === "closed"; }).length;
+    var byTier = {1:0,2:0,3:0};
+    open.forEach(function(t){ if (t.tier) byTier[t.tier] = (byTier[t.tier]||0)+1; });
+    var pending = state.health && state.health.arnie ? (state.health.arnie.pending||0) : 0;
+    k.innerHTML = "";
+    function card(n, label, cls) {
+      var c = el("div", "k");
+      c.appendChild(el("div", "n" + (cls ? " " + cls : ""), String(n)));
+      c.appendChild(el("div", "l", label));
+      return c;
+    }
+    k.appendChild(card(open.length, "open", open.length ? "" : "good"));
+    k.appendChild(card(p1.length, "P1 open", p1.length ? "bad" : ""));
+    k.appendChild(card(today.length, "today"));
+    k.appendChild(card(pending, "escalating→arnie", pending ? "warn" : ""));
+    var tc = el("div", "k");
+    var bars = el("div", "bars");
+    bars.appendChild(el("span", "b t1", "T1 " + byTier[1]));
+    bars.appendChild(el("span", "b t2", "T2 " + byTier[2]));
+    bars.appendChild(el("span", "b t3", "T3 " + byTier[3]));
+    tc.appendChild(bars);
+    tc.appendChild(el("div", "l", "open by tier"));
+    k.appendChild(tc);
+    k.appendChild(card(resolved + " / " + closed, "resolved / closed", "good"));
   }
 
   async function loadTickets(keepSel) {
@@ -475,10 +608,9 @@ export const CONSOLE_HTML = `<!doctype html>
       var res = await fetch("/api/tickets");
       var data = await res.json();
       state.tickets = data.tickets || [];
+      if (keepSel && state.selected && !state.tickets.some(function(t){ return t.id === state.selected; })) state.selected = null;
       renderList();
-      if (keepSel && state.selected) {
-        if (!state.tickets.some(function(t){ return t.id === state.selected; })) state.selected = null;
-      }
+      renderKpi();
     } catch (e) { /* transient */ }
   }
   async function loadHealth() {
@@ -489,19 +621,30 @@ export const CONSOLE_HTML = `<!doctype html>
   }
 
   // ---- admin: detail ----
-  async function selectTicket(id) {
+  function detailSig(t, arnie) {
+    return [t.updated_at, t.status, t.thread ? t.thread.length : 0, arnie ? arnie.state : "", arnie && arnie.reportText ? arnie.reportText.length : 0].join("|");
+  }
+  async function selectTicket(id, force) {
+    var changing = id !== state.selected;
     state.selected = id;
-    renderList();
     var d = document.getElementById("detail");
-    d.innerHTML = "";
-    d.appendChild(el("div", "empty", "Loading…"));
+    if (changing) {
+      state.detailSig = null;
+      renderList();
+      d.innerHTML = ""; d.appendChild(el("div", "empty", "Loading…"));
+    }
     try {
       var res = await fetch("/api/ticket?id=" + encodeURIComponent(id));
-      if (!res.ok) { d.innerHTML = ""; d.appendChild(el("div","empty","Could not load ticket.")); return; }
+      if (!res.ok) { if (changing) { d.innerHTML = ""; d.appendChild(el("div","empty","Could not load ticket.")); } return; }
       var data = await res.json();
-      renderDetail(data.ticket, data.arnie);
+      var sig = detailSig(data.ticket, data.arnie);
+      // Background refresh of the same ticket: skip the re-render when nothing
+      // changed — re-rendering was what yanked the scroll back to the top.
+      if (!force && !changing && sig === state.detailSig) return;
+      state.detailSig = sig;
+      preserveScroll(changing ? null : d, function(){ renderDetail(data.ticket, data.arnie); });
     } catch (e) {
-      d.innerHTML = ""; d.appendChild(el("div","empty","Error loading ticket."));
+      if (changing) { d.innerHTML = ""; d.appendChild(el("div","empty","Error loading ticket.")); }
     }
   }
 
@@ -509,6 +652,10 @@ export const CONSOLE_HTML = `<!doctype html>
     var d = document.getElementById("detail");
     d.innerHTML = "";
     var tr = t.triage || {};
+
+    var back = el("div", "backbtn", "← Activity");
+    back.onclick = showFeed;
+    d.appendChild(back);
 
     var dh = el("div", "dh");
     dh.appendChild(el("h2", null, t.subject || "(no subject)"));
@@ -590,6 +737,61 @@ export const CONSOLE_HTML = `<!doctype html>
     d.appendChild(ac);
   }
 
+  // ---- admin: activity feed (default detail view) ----
+  function evIcon(e) {
+    if (e.kind === "arnie") return e.status === "escalated" ? "⤴" : "✅";
+    if (e.kind === "new") return "✉";
+    if (e.kind === "turn") return "↩";
+    if (e.status === "escalated") return "🔺";
+    if (e.status === "resolved") return "✓";
+    if (e.status === "closed") return "■";
+    return "•";
+  }
+  function evText(e) {
+    if (e.kind === "new") return "ticket in";
+    if (e.kind === "turn") return "client replied";
+    if (e.kind === "arnie") return "arnie " + (e.status || "done");
+    if (e.status === "escalated") return "escalated → arnie";
+    if (e.status === "resolved") return "casey resolved" + (e.tier ? " · T" + e.tier : "");
+    if (e.status === "troubleshooting") return "casey T2 troubleshooting";
+    if (e.status === "awaiting_client") return "casey asked client";
+    if (e.status === "closed") return "closed";
+    return e.status || "";
+  }
+  function renderActivity(events) {
+    var feed = document.getElementById("feed");
+    if (!feed) return;
+    preserveScroll(document.getElementById("detail"), function(){
+      feed.innerHTML = "";
+      if (!events.length) { feed.appendChild(el("div", "ev", "No activity yet.")); return; }
+      events.forEach(function(e){
+        var row = el("div", "ev");
+        row.appendChild(el("span", "et", ago(e.at)));
+        row.appendChild(el("span", "ei", evIcon(e)));
+        var x = el("span", "ex");
+        x.appendChild(el("b", null, evText(e)));
+        if (e.subject) { x.appendChild(document.createTextNode("  ")); x.appendChild(el("span", "es", e.subject)); }
+        row.appendChild(x);
+        if (e.ticketId) row.onclick = function(){ selectTicket(e.ticketId); };
+        feed.appendChild(row);
+      });
+    });
+  }
+  async function loadActivity() {
+    try { var res = await fetch("/api/activity"); var data = await res.json(); renderActivity(data.events || []); } catch (e) { /* transient */ }
+  }
+  function showFeed() {
+    state.selected = null;
+    state.detailSig = null;
+    renderList();
+    var d = document.getElementById("detail");
+    d.innerHTML = "";
+    d.appendChild(el("div", "sec", "Activity"));
+    var feed = el("div", "feed"); feed.id = "feed";
+    d.appendChild(feed);
+    loadActivity();
+  }
+
   async function doAction(action, payload, id, returnData) {
     try {
       var res = await fetch("/api/ticket/" + action, { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(payload) });
@@ -604,7 +806,9 @@ export const CONSOLE_HTML = `<!doctype html>
   }
 
   document.getElementById("filter").onchange = function(e){ state.filter = e.target.value; renderList(); };
-  document.getElementById("refresh").onclick = function(){ loadTickets(true); loadHealth(); };
+  document.getElementById("refresh").onclick = function(){ loadTickets(true); loadHealth(); if (state.selected) selectTicket(state.selected, true); else loadActivity(); };
+  document.getElementById("search").addEventListener("input", function(e){ state.search = e.target.value; renderList(); });
+  document.getElementById("showfeed").onclick = function(){ showFeed(); };
 
   // ---- user: chat ----
   var usid = localStorage.getItem("casey_console_sid");
@@ -641,10 +845,15 @@ export const CONSOLE_HTML = `<!doctype html>
 
   // ---- boot + auto-refresh ----
   setView("admin");
+  showFeed();
   loadTickets(false);
   loadHealth();
   setInterval(function(){
-    if (state.view === "admin") { loadTickets(true); loadHealth(); if (state.selected) selectTicket(state.selected); }
+    if (state.view !== "admin") return;
+    loadTickets(true);
+    loadHealth();
+    if (state.selected) selectTicket(state.selected);   // change-detected + scroll-preserving
+    else loadActivity();
   }, 5000);
 </script>
 </body>

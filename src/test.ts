@@ -349,7 +349,7 @@ async function consoleTests(): Promise<void> {
     check(
       "console: registers page + api routes",
       server.routes.has("GET /console") && server.routes.has("GET /api/tickets") && server.routes.has("GET /api/ticket") &&
-        server.routes.has("GET /api/health") && server.routes.has("POST /api/ticket/close") &&
+        server.routes.has("GET /api/health") && server.routes.has("GET /api/activity") && server.routes.has("POST /api/ticket/close") &&
         server.routes.has("POST /api/ticket/reopen") && server.routes.has("POST /api/ticket/redispatch") &&
         server.routes.has("POST /api/ticket/reply"),
     );
@@ -393,6 +393,15 @@ async function consoleTests(): Promise<void> {
     const healthRes = await server.routes.get("GET /api/health")!(get("/api/health"));
     const h = JSON.parse(healthRes.body) as { casey: { state: string }; tickets: { total: number }; arnie: { state: string } };
     check("console: /api/health reports casey up + counts", healthRes.status === 200 && h.casey.state === "up" && h.tickets.total === 2 && typeof h.arnie.state === "string", JSON.stringify({ total: h.tickets?.total }));
+
+    const actRes = await server.routes.get("GET /api/activity")!(get("/api/activity"));
+    const act = JSON.parse(actRes.body) as { events: Array<{ kind: string; ticketId: string; status?: string }> };
+    check(
+      "console: /api/activity builds an event timeline",
+      actRes.status === 200 && act.events.length > 0 && act.events.some((e) => e.kind === "new") &&
+        act.events.some((e) => e.kind === "status" && e.status === "escalated"),
+      `events=${act.events.length}`,
+    );
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});
