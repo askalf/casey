@@ -527,6 +527,45 @@ async function consoleTests(): Promise<void> {
     await server2.routes.get("POST /api/ticket/approve")!(apReq);
     const bAfter = (await loadTickets(store)).find((t) => t.id === b.id);
     check("console: approval records the CF Access identity as approver", bAfter?.approval?.by === "alex@msp.com", bAfter?.approval?.by);
+
+    // ---- role-map admin ----
+    check(
+      "console: registers role-admin routes",
+      server.routes.has("GET /api/roles") && server.routes.has("POST /api/roles/set") && server.routes.has("POST /api/roles/remove"),
+    );
+    // trust OFF (loopback) → role admin is open. Seed an owner + a CSR (email lowercased).
+    await server.routes.get("POST /api/roles/set")!(post("/api/roles/set", { email: "boss@msp.com", role: "owner" }));
+    const setCsr = await server.routes.get("POST /api/roles/set")!(post("/api/roles/set", { email: "Jane@MSP.com", role: "csr" }));
+    const setCsrBody = JSON.parse(setCsr.body) as { ok: boolean; roles: Record<string, string> };
+    check("console: set role upserts + lowercases the email", setCsr.status === 200 && setCsrBody.roles["jane@msp.com"] === "csr" && setCsrBody.roles["boss@msp.com"] === "owner", JSON.stringify(setCsrBody.roles));
+    const badEmail = await server.routes.get("POST /api/roles/set")!(post("/api/roles/set", { email: "nope", role: "csr" }));
+    check("console: set role rejects a bad email → 400", badEmail.status === 400);
+    const badRole = await server.routes.get("POST /api/roles/set")!(post("/api/roles/set", { email: "x@y.com", role: "wizard" }));
+    check("console: set role rejects an unknown role → 400", badRole.status === 400);
+    const rolesList = JSON.parse((await server.routes.get("GET /api/roles")!(get("/api/roles"))).body) as { roles: Record<string, string>; assignable: string[]; enforced: boolean };
+    check("console: list roles returns map + assignable, not enforced when trust off", rolesList.enforced === false && rolesList.roles["jane@msp.com"] === "csr" && rolesList.assignable.indexOf("dispatch") >= 0);
+    const rmJane = await server.routes.get("POST /api/roles/remove")!(post("/api/roles/remove", { email: "jane@msp.com" }));
+    const rmJaneBody = JSON.parse(rmJane.body) as { ok: boolean; roles: Record<string, string> };
+    check("console: remove role deletes the mapping", rmJane.status === 200 && !("jane@msp.com" in rmJaneBody.roles));
+    const rmMissing = await server.routes.get("POST /api/roles/remove")!(post("/api/roles/remove", { email: "ghost@msp.com" }));
+    check("console: remove an unmapped email → 404", rmMissing.status === 404);
+    // lockout guard: boss is now the only owner — refuse to downgrade or remove it.
+    const downgrade = await server.routes.get("POST /api/roles/set")!(post("/api/roles/set", { email: "boss@msp.com", role: "dispatch" }));
+    check("console: cannot downgrade the last owner → 409", downgrade.status === 409);
+    const rmOwner = await server.routes.get("POST /api/roles/remove")!(post("/api/roles/remove", { email: "boss@msp.com" }));
+    check("console: cannot remove the last owner → 409", rmOwner.status === 409);
+
+    // owner-gating behind CF Access (server2 trusts the header; rfile now has alex=dispatch + boss=owner)
+    const rolesReq = (email?: string): ServerRequest => ({ method: "GET", path: "/api/roles", query: {}, headers: email ? { "cf-access-authenticated-user-email": email } : {}, body: "" });
+    const asNonOwner = await server2.routes.get("GET /api/roles")!(rolesReq("alex@msp.com"));
+    check("console: role admin is owner-only behind CF Access (non-owner → 403)", asNonOwner.status === 403);
+    const asOwner = await server2.routes.get("GET /api/roles")!(rolesReq("boss@msp.com"));
+    const asOwnerBody = JSON.parse(asOwner.body) as { enforced: boolean; self: string };
+    check("console: owner lists roles behind CF Access (enforced + self set)", asOwner.status === 200 && asOwnerBody.enforced === true && asOwnerBody.self === "boss@msp.com", JSON.stringify(asOwnerBody));
+    const noHdrRoles = await server2.routes.get("GET /api/roles")!(rolesReq());
+    check("console: role admin denies a missing identity behind CF Access → 403", noHdrRoles.status === 403);
+    const setDenied = await server2.routes.get("POST /api/roles/set")!({ method: "POST", path: "/api/roles/set", query: {}, headers: { "cf-access-authenticated-user-email": "alex@msp.com" }, body: JSON.stringify({ email: "intruder@x.com", role: "owner" }) });
+    check("console: a non-owner cannot set roles behind CF Access → 403", setDenied.status === 403);
   } finally {
     await fsp.rm(store, { force: true }).catch(() => {});
     await fsp.rm(queue, { recursive: true, force: true }).catch(() => {});

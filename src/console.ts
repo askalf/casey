@@ -63,6 +63,72 @@ async function loadRoleMap(ctx: ConsoleCtx): Promise<Record<string, string>> {
   }
 }
 
+/** Roles a staff email can be mapped to — mirrors the client ROLES catalog ids. */
+const ROLE_IDS = ["owner", "csr", "dispatch", "t3", "security", "backup", "bench", "procurement", "project", "sales", "am", "accounting", "dev"];
+
+function ownerCount(map: Record<string, string>): number {
+  return Object.values(map).filter((r) => r === "owner").length;
+}
+
+/** Atomically persist the email→role map (temp file + rename so a crash can't truncate it). */
+async function saveRoleMap(ctx: ConsoleCtx, map: Record<string, string>): Promise<void> {
+  await fsp.mkdir(path.dirname(ctx.rolesFile), { recursive: true }).catch(() => {});
+  const tmp = ctx.rolesFile + ".tmp";
+  await fsp.writeFile(tmp, JSON.stringify(map, null, 2) + "\n", "utf8");
+  await fsp.rename(tmp, ctx.rolesFile);
+}
+
+/**
+ * Who may edit the role map. Owner-only when casey is behind CF Access. On
+ * loopback/dev (trustAccessHeader off) the console is unauthenticated and only
+ * reachable on 127.0.0.1, so it's fully trusted there too — same model the rest
+ * of the console uses (everyone is owner on the box). The server enforces this
+ * regardless of what the UI shows.
+ */
+async function canAdminRoles(ctx: ConsoleCtx, req: ServerRequest): Promise<boolean> {
+  if (!ctx.trustAccessHeader) return true;
+  const email = actingEmail(ctx, req);
+  if (!email) return false;
+  return (await loadRoleMap(ctx))[email] === "owner";
+}
+
+/** List the email→role map + the assignable roles (owner-gated). */
+async function listRoles(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  if (!(await canAdminRoles(ctx, req))) return json(403, { error: "owner only" });
+  return json(200, { roles: await loadRoleMap(ctx), assignable: ROLE_IDS, self: actingEmail(ctx, req), enforced: ctx.trustAccessHeader });
+}
+
+/** Upsert one email→role mapping (owner-gated). Refuses to strand the last owner. */
+async function setRole(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  if (!(await canAdminRoles(ctx, req))) return json(403, { error: "owner only" });
+  const body = parseBody(req);
+  const email = String(body.email ?? "").trim().toLowerCase();
+  const role = String(body.role ?? "").trim();
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(400, { error: "a valid email is required" });
+  if (ROLE_IDS.indexOf(role) < 0) return json(400, { error: "unknown role" });
+  const map = await loadRoleMap(ctx);
+  if (map[email] === "owner" && role !== "owner" && ownerCount(map) <= 1) {
+    return json(409, { error: "cannot downgrade the last owner — promote another owner first" });
+  }
+  map[email] = role;
+  await saveRoleMap(ctx, map);
+  return json(200, { ok: true, roles: map });
+}
+
+/** Remove one email→role mapping (owner-gated). Refuses to remove the last owner. */
+async function removeRole(ctx: ConsoleCtx, req: ServerRequest): Promise<ServerResponse> {
+  if (!(await canAdminRoles(ctx, req))) return json(403, { error: "owner only" });
+  const email = String(parseBody(req).email ?? "").trim().toLowerCase();
+  const map = await loadRoleMap(ctx);
+  if (!(email in map)) return json(404, { error: "not mapped" });
+  if (map[email] === "owner" && ownerCount(map) <= 1) {
+    return json(409, { error: "cannot remove the last owner — promote another owner first" });
+  }
+  delete map[email];
+  await saveRoleMap(ctx, map);
+  return json(200, { ok: true, roles: map });
+}
+
 function parseBody(req: ServerRequest): Record<string, unknown> {
   try {
     return JSON.parse(req.body || "{}") as Record<string, unknown>;
@@ -606,6 +672,9 @@ export function registerConsole(server: ChannelServer, ctx: ConsoleCtx): void {
   server.route("POST", "/api/project/task", (req) => projectTask(ctx, req));
   server.route("GET", "/api/graduations", async () => json(200, await computeGraduations(ctx)));
   server.route("POST", "/api/graduation/promote", (req) => promoteGraduation(ctx, req));
+  server.route("GET", "/api/roles", (req) => listRoles(ctx, req));
+  server.route("POST", "/api/roles/set", (req) => setRole(ctx, req));
+  server.route("POST", "/api/roles/remove", (req) => removeRole(ctx, req));
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +778,18 @@ export const CONSOLE_HTML = `<!doctype html>
   /* roles */
   .rolewrap { color:var(--dim); font-size:12px; display:flex; align-items:center; gap:6px; }
   #role { background:var(--chip); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:5px 8px; font:inherit; }
+  /* staff & roles admin modal */
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:flex-start; justify-content:center; z-index:50; }
+  .modal .sheet { background:var(--panel); border:1px solid var(--line); border-radius:12px; width:min(640px,92vw); margin-top:8vh; max-height:80vh; display:flex; flex-direction:column; overflow:hidden; }
+  .sheethd { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  .sheethd b { font-size:15px; }
+  .sheetnote { padding:9px 16px; color:var(--dim); font-size:12.5px; border-bottom:1px solid var(--line); }
+  #rolesList { overflow-y:auto; padding:4px 0; }
+  .rrow { display:flex; align-items:center; gap:10px; padding:9px 16px; border-bottom:1px solid var(--line); }
+  .rrow .em { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rrow .me { color:var(--green); font-size:11px; }
+  .addrow { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
+  .addrow input { flex:1; background:var(--chip); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font:inherit; }
   .rolenote { color:var(--dim); font-size:12.5px; background:#10131a; border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:10px; }
   .planned { max-width:520px; margin:46px auto; text-align:center; background:var(--panel); border:1px dashed #2a2f3a; border-radius:12px; padding:28px; }
   .planned .pl { font-size:11px; letter-spacing:.08em; color:var(--amber); margin-bottom:8px; }
@@ -740,6 +821,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <div class="tab active" id="tab-admin">Admin / Dev</div>
     </div>
     <div class="rolewrap">role <select id="role"></select></div>
+    <button class="btn" id="staffBtn" style="display:none">Staff</button>
     <div class="grow"></div>
     <div class="live" id="live"><span class="dot" id="d-casey"></span>casey
       <span class="dot" id="d-arnie"></span>arnie
@@ -779,6 +861,18 @@ export const CONSOLE_HTML = `<!doctype html>
       </div>
     </div>
   </main>
+  <div class="modal" id="rolesModal" style="display:none">
+    <div class="sheet">
+      <div class="sheethd"><b>Staff &amp; Roles</b><div class="grow"></div><button class="btn" id="rolesClose">Close</button></div>
+      <div class="sheetnote" id="rolesNote"></div>
+      <div id="rolesList"></div>
+      <div class="addrow">
+        <input id="newEmail" type="email" placeholder="name@company.com" autocomplete="off" />
+        <select id="newRole"></select>
+        <button class="btn primary" id="addRole">Add</button>
+      </div>
+    </div>
+  </div>
   <div class="toast" id="toast"></div>
 <script>
   var state = { tickets: [], selected: null, filter: "all", view: "admin", search: "", health: null, detailSig: null, role: "owner", clients: [], projects: [], selectedProject: null, selectedClient: null, graduations: null, selectedPattern: null, authed: false, authedEmail: null };
@@ -864,6 +958,7 @@ export const CONSOLE_HTML = `<!doctype html>
   }
   function applyRole() {
     var r = activeRole();
+    updateStaffBtn();
     localStorage.setItem("casey_role", r.id);
     var sel = document.getElementById("role"); if (sel) sel.value = r.id;
     if (!r.live) {
@@ -1708,6 +1803,73 @@ export const CONSOLE_HTML = `<!doctype html>
       sel.onchange = function(e){ state.role = e.target.value; applyRole(); };
     }
   }
+  // ---- staff & roles admin (owner-only entry; the server enforces it too) ----
+  function updateStaffBtn() {
+    var b = document.getElementById("staffBtn");
+    if (b) b.style.display = (state.role === "owner") ? "" : "none";
+  }
+  function roleLabel(id) { for (var i=0;i<ROLES.length;i++){ if (ROLES[i].id===id) return ROLES[i].label; } return id; }
+  function fillRoleOptions(sel, current) {
+    sel.innerHTML = "";
+    ROLES.forEach(function(r){ var o=document.createElement("option"); o.value=r.id; o.textContent=r.label; if (r.id===current) o.selected=true; sel.appendChild(o); });
+  }
+  async function openRoles() {
+    document.getElementById("rolesModal").style.display = "flex";
+    fillRoleOptions(document.getElementById("newRole"), "csr");
+    document.getElementById("newEmail").value = "";
+    await loadRoles();
+  }
+  function closeRoles() { document.getElementById("rolesModal").style.display = "none"; }
+  async function loadRoles() {
+    var note = document.getElementById("rolesNote");
+    var list = document.getElementById("rolesList");
+    list.innerHTML = "";
+    try {
+      var res = await fetch("/api/roles");
+      if (res.status === 403) { note.textContent = "Owner only."; list.appendChild(el("div","rrow","Not authorized.")); return; }
+      var data = await res.json();
+      note.textContent = data.enforced
+        ? "Each Cloudflare Access email maps to a role. Changes apply on that person's next page load. Add them to the CF Access policy too, or they can't reach the console."
+        : "Loopback/dev — identity isn't enforced here (anyone on this host acts as owner). The map still drives roles once CF Access is on in production.";
+      var emails = Object.keys(data.roles || {}).sort();
+      if (!emails.length) { list.appendChild(el("div","rrow","No staff mapped yet — add one below.")); return; }
+      emails.forEach(function(email){
+        var row = el("div","rrow");
+        var em = el("div","em"); em.appendChild(el("span",null,email));
+        if (email === data.self) em.appendChild(el("span","me"," · you"));
+        row.appendChild(em);
+        var sel = document.createElement("select"); sel.className="btn"; fillRoleOptions(sel, data.roles[email]);
+        sel.onchange = function(){ saveRole(email, sel.value); };
+        row.appendChild(sel);
+        var rm = el("button","btn warn","Remove");
+        rm.onclick = function(){ dropRole(email); };
+        row.appendChild(rm);
+        list.appendChild(row);
+      });
+    } catch (e) { note.textContent = "Could not load roles."; }
+  }
+  async function saveRole(email, role) {
+    var res = await fetch("/api/roles/set", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ email: email, role: role }) });
+    if (!res.ok) { var e = await res.json().catch(function(){ return {}; }); toast(e.error || "failed"); }
+    else toast(email + " → " + roleLabel(role));
+    await loadRoles();
+  }
+  async function dropRole(email) {
+    var res = await fetch("/api/roles/remove", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ email: email }) });
+    if (!res.ok) { var e = await res.json().catch(function(){ return {}; }); toast(e.error || "failed"); }
+    else toast("removed " + email);
+    await loadRoles();
+  }
+  document.getElementById("staffBtn").onclick = openRoles;
+  document.getElementById("rolesClose").onclick = closeRoles;
+  document.getElementById("rolesModal").onclick = function(e){ if (e.target.id === "rolesModal") closeRoles(); };
+  document.getElementById("addRole").onclick = async function(){
+    var email = document.getElementById("newEmail").value.trim().toLowerCase();
+    if (!email) { toast("enter an email"); return; }
+    await saveRole(email, document.getElementById("newRole").value);
+    document.getElementById("newEmail").value = "";
+  };
+
   async function boot() {
     try {
       var me = await (await fetch("/api/me")).json();
